@@ -5,6 +5,16 @@ The Electron/HTML edition has been removed; the PySide6 app that used to live in
 The data file, its format and the backup layout are unchanged, so existing installs keep all their data.
 Installer registry keys are unchanged too, so `TaskTrail-Setup-*.exe` upgrades an existing install in place.
 
+## v2.2
+### Checklist merged into the board
+There is now one set of tasks. On first launch every Checklist group becomes a **label** and every checklist task becomes a board card carrying that label (To Do, or Done if it was ticked). A backup of the previous data file is written first (Backup & Restore → list). The **Task List** page (Alt 3) replaces Task Checklist: the same cards as the board, one line each, grouped by column, due date, label or priority. Ticking a row completes the card exactly like the board checkbox. Restoring an older backup re-runs the merge automatically. Excel export no longer has Checklist sheets.
+
+### Recurring tasks
+`repeat` (daily · weekdays · weekly · monthly · yearly) and optional `repeatUntil` on a card. Completing a recurring card — checkbox, Mark complete, dragging it to Done or ticking it in the list — advances its due date to the next occurrence after today and keeps it in its column, logged as "Completed ↻ next due …" with a completion history. When the end date is reached it completes normally. "Skip once" in the detail panel moves it on without a completion. The calendar draws upcoming occurrences as dashed ghost chips (not draggable). Quick-add: `*daily` etc.
+
+### Layout
+Board columns stretch to fill the window (176–380 px) and shrink so all columns stay visible when the task pane slides open; the pane animates in and out. Due-date fields are wide enough for the full date.
+
 ## v2.1
 Data file format is unchanged. Everything below is additive.
 - **Quick-add in every column** — `Renew SSL !high #ops @fri`. Enter saves; Shift+Enter opens the full form with the parsed values.

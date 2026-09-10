@@ -2,7 +2,7 @@
 Unicode true
 !include "MUI2.nsh"
 !define APP "TaskTrail"
-!define VER "2.1.0"
+!define VER "2.2.0"
 !define EXE "TaskTrail.exe"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\TaskTrailPy"
 

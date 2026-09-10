@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QFontComboBox, QSlider, QInputDialog, QSplitter, QGraphicsOpacityEffect)
 
 APP_NAME = "TaskTrail"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 MONTHS_LONG = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
                'September', 'October', 'November', 'December']
@@ -166,6 +166,49 @@ def is_overdue(d, done):
         return False
 
 
+REPEATS = [("", "No repeat"), ("daily", "Every day"), ("weekdays", "Every weekday"), ("weekly", "Every week"), ("monthly", "Every month"), ("yearly", "Every year")]
+REPEAT_SHORT = {"daily": "daily", "weekdays": "weekdays", "weekly": "weekly", "monthly": "monthly", "yearly": "yearly"}
+
+
+def repeat_step(d, repeat):
+    """The occurrence after date `d` for a repeat rule."""
+    if repeat == "daily": return d + dt.timedelta(1)
+    if repeat == "weekdays":
+        d += dt.timedelta(1)
+        while d.weekday() > 4: d += dt.timedelta(1)
+        return d
+    if repeat == "weekly": return d + dt.timedelta(7)
+    if repeat == "monthly":
+        y, m = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+        return dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+    if repeat == "yearly": return dt.date(d.year + 1, d.month, min(d.day, calendar.monthrange(d.year + 1, d.month)[1]))
+    return None
+
+
+def next_due(iso, repeat, after=None):
+    """Next occurrence strictly after `after` (default: the due date itself). None if the rule is empty/invalid."""
+    try: d = dt.date.fromisoformat(iso)
+    except (TypeError, ValueError): return None
+    after = after or d
+    while d <= after:
+        d = repeat_step(d, repeat)
+        if d is None: return None
+    return d
+
+
+def occurrences(card, start, end):
+    """Projected future dates of a recurring card inside [start, end], after its current due date (which is shown as the real card)."""
+    if not card.get("repeat") or not card.get("dueDate"): return []
+    try: d = dt.date.fromisoformat(card["dueDate"]); until = dt.date.fromisoformat(card["repeatUntil"]) if card.get("repeatUntil") else None
+    except ValueError: return []
+    out = []
+    while True:
+        d = repeat_step(d, card["repeat"])
+        if d is None or d > end or (until and d > until) or len(out) > 62: break
+        if d >= start: out.append(d)
+    return out
+
+
 DOW = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']     # date.weekday(): Mon = 0
 
 
@@ -191,9 +234,13 @@ def parse_quick(store, text, create=True):
     out = dict(title="", priority="med", dueDate="", labels=[]); keep = []
     for w in text.split():
         sig, val = w[0], w[1:]
-        if sig not in "!#@" or not val: keep.append(w); continue
+        if sig not in "!#@*" or not val: keep.append(w); continue
         v = val.lower()
-        if sig == "!":
+        if sig == "*":
+            rp = {"daily": "daily", "day": "daily", "weekdays": "weekdays", "weekday": "weekdays", "weekly": "weekly", "week": "weekly", "monthly": "monthly", "month": "monthly", "yearly": "yearly", "year": "yearly"}.get(v)
+            if rp: out["repeat"] = rp
+            else: keep.append(w)
+        elif sig == "!":
             pri = {"high": "high", "h": "high", "hi": "high", "urgent": "high", "low": "low", "l": "low", "med": "med", "m": "med", "medium": "med"}.get(v)
             if pri: out["priority"] = pri
             else: keep.append(w)
@@ -209,7 +256,9 @@ def parse_quick(store, text, create=True):
             if not l:
                 l = {"id": uid(), "name": val, "color": LABEL_PALETTE[len(store.labels) % len(LABEL_PALETTE)]}; store.labels.append(l)
             if l["id"] not in out["labels"]: out["labels"].append(l["id"])
-    out["title"] = " ".join(keep).strip(); return out
+    out["title"] = " ".join(keep).strip()
+    if out.get("repeat") and not out["dueDate"]: out["dueDate"] = dt.date.today().isoformat()      # a repeat needs a date to count from
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -234,7 +283,10 @@ class Store:
             except Exception:
                 raw = None
         self.db = self.normalize(raw)
-        self.ensure_year(self.year)
+        self.ensure_year(self.year); self.merged_count = 0
+        if not self.db["meta"].get("checklistMerged"):        # one-time: checklist → board (backup of the old file first)
+            if raw is not None: self.backup_now()
+            self.merged_count = self.merge_checklist(); self.save()
 
     @staticmethod
     def normalize(raw):
@@ -260,15 +312,46 @@ class Store:
         return d
 
     def ensure_year(self, y):
-        Y = self.db["years"].setdefault(str(y), {"kanban": {}, "checklist": {}})
+        Y = self.db["years"].setdefault(str(y), {"kanban": {}})
         Y.setdefault("kanban", {})
-        Y.setdefault("checklist", {})
         for mi in range(12):
             k = Y["kanban"].setdefault(str(mi), {})
             for c in self.db["columns"]:
                 k.setdefault(c["id"], [])
-            Y["checklist"].setdefault(str(mi), [])
         return Y
+
+    def merge_checklist(self):
+        """Checklist groups become labels; their tasks become board cards (To Do, or Done if ticked). Runs once, also for restored old backups."""
+        moved = 0
+        for y, Y in list(self.db["years"].items()):
+            for mi, groups in list((Y.get("checklist") or {}).items()):
+                for g in groups or []:
+                    if not g.get("tasks"): continue
+                    l = next((x for x in self.labels if x["name"].lower() == g["name"].strip().lower()), None)
+                    if not l:
+                        l = {"id": uid(), "name": g["name"].strip(), "color": LABEL_PALETTE[len(self.labels) % len(LABEL_PALETTE)]}; self.labels.append(l)
+                    kd = self.kanban(int(mi), int(y))
+                    for t in g["tasks"]:
+                        done = bool(t.get("done"))
+                        card = dict(id=t.get("id") or uid(), title=t.get("title", ""), desc="", priority=t.get("priority", "med"), dueDate=t.get("dueDate", ""), done=done,
+                                    subs=t.get("subs", []), labels=[l["id"]], comments=[], activity=[], createdAt=t.get("createdAt") or now_iso(), month=MONTHS[int(mi)], year=int(y))
+                        if t.get("migratedFrom"): card["migratedFrom"] = t["migratedFrom"]
+                        self.log(card, f'Merged from checklist group "{g["name"]}"'); kd.setdefault("done" if done else "todo", []).append(card); moved += 1
+            Y.pop("checklist", None)
+        self.db["meta"]["checklistMerged"] = now_iso(); self.db["meta"]["checklistMergedCount"] = moved
+        return moved
+
+    def complete_recurring(self, card):
+        """Ticking a recurring card advances its due date instead of finishing it. Returns the new date, or None if the rule ended."""
+        today = dt.date.today()
+        try: due = dt.date.fromisoformat(card["dueDate"])
+        except (TypeError, ValueError): return None
+        nd = next_due(card["dueDate"], card["repeat"], after=max(due, today))
+        if nd is None or (card.get("repeatUntil") and nd.isoformat() > card["repeatUntil"]):
+            card["repeat"] = ""; return None
+        card.setdefault("completions", []).append(today.isoformat()); del card["completions"][:-120]
+        card["dueDate"] = nd.isoformat(); card["updatedAt"] = now_iso(); self.log(card, f"Completed ↻ next due {fmt_date(card['dueDate'])}")
+        return card["dueDate"]
 
     def save(self):
         self.db["meta"]["updatedAt"] = int(time.time() * 1000)
@@ -292,10 +375,6 @@ class Store:
     def kanban(self, mi=None, year=None):
         Y = self.ensure_year(year or self.year)
         return Y["kanban"][str(self.month if mi is None else mi)]
-
-    def checklist(self, mi=None, year=None):
-        Y = self.ensure_year(year or self.year)
-        return Y["checklist"][str(self.month if mi is None else mi)]
 
     def years(self):
         return sorted(int(y) for y in self.db["years"])
@@ -329,6 +408,10 @@ class Store:
         else:
             at = next((i for i, c in enumerate(dst) if c["id"] == before_id), len(dst))
         dst.insert(at, card)
+        if to_col == "done" and from_col != "done" and card.get("repeat") and card.get("dueDate"):
+            if self.complete_recurring(card):                       # stays in its column with the next date
+                dst.pop(at); src.insert(idx, card); card["recurred"] = True; return card
+        card.pop("recurred", None)
         if from_col != to_col:
             card["done"] = to_col == "done"
             if to_col == "done":
@@ -343,9 +426,6 @@ class Store:
     def incomplete_cards(self, mi, year):
         kd = self.kanban(mi, year)
         return [c for cid in self.incomplete_col_ids() for c in kd.get(cid, []) if not c.get("done")]
-
-    def incomplete_cl(self, mi, year):
-        return [t for g in self.checklist(mi, year) for t in g["tasks"] if not t.get("done")]
 
     @staticmethod
     def month_past(mi, year):
@@ -379,18 +459,6 @@ class Store:
                 tgt.setdefault("todo" if cid == "today" else cid, []).insert(0, m)
                 moved_k += 1
             src[cid] = [c for c in arr if c.get("done")]
-        for g in self.checklist(mi, year):
-            inc = [t for t in g["tasks"] if not t.get("done")]
-            if not inc:
-                continue
-            tg = next((x for x in self.checklist(tm, ty) if x["name"] == g["name"]), None)
-            if not tg:
-                tg = {"id": uid(), "name": g["name"], "tasks": []}
-                self.checklist(tm, ty).append(tg)
-            for t in inc:
-                m = copy.deepcopy(t); m.update(id=uid(), migratedFrom=label, migratedAt=now_iso(), originalId=t["id"])
-                tg["tasks"].insert(0, m); moved_c += 1
-            g["tasks"] = [t for t in g["tasks"] if t.get("done")]
         self.db["migrations"].append({"fromYear": year, "from": mi, "toYear": ty, "to": tm, "kanban": moved_k,
                                       "checklist": moved_c, "at": now_iso(), "auto": auto})
         self.save()
@@ -399,7 +467,7 @@ class Store:
     def auto_migrate(self):
         total = 0
         for y, mi in self.past_periods():
-            if not self.incomplete_cards(mi, y) and not self.incomplete_cl(mi, y):
+            if not self.incomplete_cards(mi, y):
                 continue
             if any(m.get("fromYear") == y and m["from"] == mi and m.get("auto") for m in self.db["migrations"]):
                 continue
@@ -408,7 +476,7 @@ class Store:
         return total
 
     def pending_rollover(self):
-        return any(self.incomplete_cards(mi, y) or self.incomplete_cl(mi, y) for y, mi in self.past_periods())
+        return any(self.incomplete_cards(mi, y) for y, mi in self.past_periods())
 
     # ---- backups ----
     def backup_now(self):
@@ -608,9 +676,12 @@ class CardWidget(QFrame):
         if card.get("dueDate"):
             od = is_overdue(card["dueDate"], done)
             meta.addWidget(badge(("⚠ " if od else "📅 ") + fmt_date(card["dueDate"]), "#ff6584" if od else "#8890b0"))
-        if card.get("migratedFrom"):
-            meta.addWidget(badge("↪ " + card["migratedFrom"], "#8890b0"))
         meta.addStretch(); v.addLayout(meta)
+        if card.get("repeat") or card.get("migratedFrom"):      # second row so narrow columns don't clip the badges
+            m2 = QHBoxLayout(); m2.setSpacing(5)
+            if card.get("repeat"): m2.addWidget(badge("↻ " + REPEAT_SHORT.get(card["repeat"], card["repeat"]), "#b48aff"))
+            if card.get("migratedFrom"): m2.addWidget(badge("↪ " + card["migratedFrom"], "#8890b0"))
+            m2.addStretch(); v.addLayout(m2)
         if card.get("desc"):
             d = QLabel(card["desc"][:160] + ("…" if len(card["desc"]) > 160 else "")); d.setObjectName("muted2"); d.setWordWrap(True); v.addWidget(d)
         subs = card.get("subs", [])
@@ -677,14 +748,35 @@ class CardList(QListWidget):
         self.dropped.emit(cid, src.col_id, self.col_id, before)
 
 
+class ListRow(QFrame):
+    """One task in the list view — the same card as on the board, one line."""
+    clicked = Signal(str, str); toggle = Signal(str, str)
+
+    def __init__(self, store, card, col):
+        super().__init__(); self.setObjectName("card"); self.card = card; self.col_id = col["id"]; self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setStyleSheet(f"QFrame#card{{border-left:3px solid {col['color']};}}"); h = QHBoxLayout(self); h.setContentsMargins(10, 6, 10, 6); h.setSpacing(8)
+        done = card.get("done") or col["id"] == "done"; cb = QCheckBox(); cb.setChecked(done); cb.setToolTip("Complete / reopen"); cb.clicked.connect(lambda: self.toggle.emit(card["id"], col["id"])); h.addWidget(cb)
+        t = QLabel(card["title"]); t.setWordWrap(True); t.setStyleSheet("font-weight:500;" + ("text-decoration:line-through;color:#5c6382;" if done else "")); h.addWidget(t, 1)
+        subs = card.get("subs", [])
+        if subs: h.addWidget(badge(f"☑ {sum(1 for x in subs if x.get('done'))}/{len(subs)}", "#8890b0"))
+        for l in (x for x in store.labels if x["id"] in card.get("labels", [])): h.addWidget(badge(l["name"], "#ffffff", l["color"]))
+        if card.get("repeat"): h.addWidget(badge("↻ " + REPEAT_SHORT.get(card["repeat"], card["repeat"]), "#b48aff"))
+        if card.get("dueDate"): od = is_overdue(card["dueDate"], done); h.addWidget(badge(("⚠ " if od else "📅 ") + fmt_date(card["dueDate"]), "#ff6584" if od else "#8890b0"))
+        h.addWidget(badge(PRI_LABEL[card.get("priority", "med")], PRI_COLOR[card.get("priority", "med")]))
+        h.addWidget(badge(f"{col.get('icon', '')} {col['label']}", "#ffffff", col["color"]))
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton: self.clicked.emit(self.card["id"], self.col_id)
+
+
 class CalChip(QLabel):
     """A task on the calendar. Board cards (drag_id set) can be dragged onto a day or the Unscheduled tray."""
-    def __init__(self, text, color, drag_id=None, done=False, overdue=False, dashed=False, on_click=None):
+    def __init__(self, text, color, drag_id=None, done=False, overdue=False, dashed=False, on_click=None, ghost=False):
         super().__init__(text); self.drag_id = drag_id; self.on_click = on_click; self._press = None
-        self.setToolTip(text + (" — drag to reschedule" if drag_id else " — click to edit")); self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setToolTip(text + (" — drag to reschedule" if drag_id else " — future occurrence; complete the task to move it here" if ghost else " — click to open")); self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)      # clip long titles instead of widening the day
-        self.setStyleSheet(f"QLabel{{border-left:3px {'dashed' if dashed else 'solid'} {color};border-radius:5px;padding:2px 6px;background:{rgba(color, 0.14)};"
-                           + ("text-decoration:line-through;color:#5c6382;" if done else "color:#ff6584;font-weight:600;" if overdue else "") + "}")
+        self.setStyleSheet(f"QLabel{{border-left:3px {'dashed' if dashed else 'solid'} {color};border-radius:5px;padding:2px 6px;background:{rgba(color, 0.05 if ghost else 0.14)};"
+                           + ("color:#8890b0;" if ghost else "text-decoration:line-through;color:#5c6382;" if done else "color:#ff6584;font-weight:600;" if overdue else "") + "}")
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton: self._press = e.position().toPoint()
@@ -743,11 +835,20 @@ class TaskDialog(QDialog):
         if card and card.get("dueDate"):
             self.has_date.setChecked(True); self.date.setDate(QDate.fromString(card["dueDate"], "yyyy-MM-dd"))
         self.date.setEnabled(self.has_date.isChecked()); self.has_date.toggled.connect(self.date.setEnabled)
+        self.rep = QComboBox()
+        for k, lab in REPEATS: self.rep.addItem(("↻ " if k else "") + lab, k)
+        self.rep.setCurrentIndex(max(0, self.rep.findData(card.get("repeat", "") if card else "")))
+        self.has_until = QCheckBox("until"); self.until = QDateEdit(QDate.currentDate().addMonths(3)); self.until.setCalendarPopup(True); self.until.setDisplayFormat("yyyy-MM-dd"); self.until.setMinimumWidth(150)
+        if card and card.get("repeatUntil"): self.has_until.setChecked(True); self.until.setDate(QDate.fromString(card["repeatUntil"], "yyyy-MM-dd"))
+        def rep_changed():
+            on = bool(self.rep.currentData()); self.has_until.setEnabled(on); self.until.setEnabled(on and self.has_until.isChecked())
+            if on and not self.has_date.isChecked(): self.has_date.setChecked(True)
+        self.rep.currentIndexChanged.connect(rep_changed); self.has_until.toggled.connect(rep_changed); rep_changed()
         v.addWidget(QLabel("Title *")); v.addWidget(self.title)
         v.addWidget(QLabel("Description")); v.addWidget(self.desc)
         g = QGridLayout(); g.addWidget(QLabel("Column"), 0, 0); g.addWidget(QLabel("Priority"), 0, 1)
         g.addWidget(self.col, 1, 0); g.addWidget(self.pri, 1, 1); v.addLayout(g)
-        dr = QHBoxLayout(); dr.addWidget(self.has_date); dr.addWidget(self.date); dr.addStretch(); v.addLayout(dr)
+        dr = QHBoxLayout(); dr.addWidget(self.has_date); dr.addWidget(self.date); dr.addSpacing(16); dr.addWidget(QLabel("Repeat")); dr.addWidget(self.rep); dr.addWidget(self.has_until); dr.addWidget(self.until); dr.addStretch(); v.addLayout(dr)
         # labels
         lr = QHBoxLayout(); lr.addWidget(QLabel("Labels")); mb = QPushButton("Manage"); mb.clicked.connect(self.manage_labels); lr.addWidget(mb); lr.addStretch(); v.addLayout(lr)
         self.label_box = QWidget(); self.label_layout = QHBoxLayout(self.label_box); self.label_layout.setContentsMargins(0, 0, 0, 0)
@@ -769,6 +870,7 @@ class TaskDialog(QDialog):
             self.title.setText(preset.get("title", "")); self.pri.setCurrentIndex(self.pri.findData(preset.get("priority", "med")))
             if preset.get("dueDate"): self.has_date.setChecked(True); self.date.setDate(QDate.fromString(preset["dueDate"], "yyyy-MM-dd"))
             self.sel_labels = set(preset.get("labels", [])); self.rebuild_labels()
+            if preset.get("repeat"): self.rep.setCurrentIndex(max(0, self.rep.findData(preset["repeat"])))
 
     def rebuild_labels(self):
         while self.label_layout.count():
@@ -814,7 +916,8 @@ class TaskDialog(QDialog):
     def values(self):
         return dict(title=self.title.text().strip(), desc=self.desc.toPlainText().strip(), col=self.col.currentData(),
                     priority=self.pri.currentData(), dueDate=self.date.date().toString("yyyy-MM-dd") if self.has_date.isChecked() else "",
-                    subs=self.subs, labels=list(self.sel_labels))
+                    subs=self.subs, labels=list(self.sel_labels), repeat=self.rep.currentData() or "",
+                    repeatUntil=self.until.date().toString("yyyy-MM-dd") if self.rep.currentData() and self.has_until.isChecked() else "")
 
 
 class LabelDialog(QDialog):
@@ -917,47 +1020,6 @@ class ColumnDialog(QDialog):
         self.result_action = action; self.accept()
 
 
-class ChecklistTaskDialog(QDialog):
-    def __init__(self, parent, task):
-        super().__init__(parent); self.setWindowTitle("Edit task"); self.setMinimumWidth(420)
-        v = QVBoxLayout(self)
-        self.title = QLineEdit(task["title"]); v.addWidget(QLabel("Title *")); v.addWidget(self.title)
-        self.pri = QComboBox()
-        for k, lab in PRI_LABEL.items(): self.pri.addItem(lab, k)
-        self.pri.setCurrentIndex(self.pri.findData(task.get("priority", "med")))
-        self.has_date = QCheckBox("Due date"); self.date = QDateEdit(QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat("yyyy-MM-dd")
-        if task.get("dueDate"):
-            self.has_date.setChecked(True); self.date.setDate(QDate.fromString(task["dueDate"], "yyyy-MM-dd"))
-        self.date.setEnabled(self.has_date.isChecked()); self.has_date.toggled.connect(self.date.setEnabled)
-        r = QHBoxLayout(); r.addWidget(QLabel("Priority")); r.addWidget(self.pri); r.addWidget(self.has_date); r.addWidget(self.date); v.addLayout(r)
-        self.subs = [dict(s) for s in task.get("subs", [])]; self.sub_list = QListWidget(); self.sub_list.setFixedHeight(100); self.rebuild(); v.addWidget(QLabel("Sub-tasks")); v.addWidget(self.sub_list)
-        sr = QHBoxLayout(); self.inp = QLineEdit(); self.inp.setPlaceholderText("Add sub-task… (Enter)"); self.inp.returnPressed.connect(self.add)
-        rb = QPushButton("Remove selected"); rb.clicked.connect(self.remove); sr.addWidget(self.inp); sr.addWidget(rb); v.addLayout(sr)
-        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel); bb.button(QDialogButtonBox.Save).setObjectName("primary")
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); v.addWidget(bb)
-        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.accept)
-
-    def rebuild(self):
-        self.sub_list.clear()
-        for s in self.subs: self.sub_list.addItem(("✓ " if s.get("done") else "○ ") + s["text"])
-
-    def add(self):
-        t = self.inp.text().strip()
-        if t: self.subs.append({"id": uid(), "text": t, "done": False}); self.inp.clear(); self.rebuild()
-
-    def remove(self):
-        r = self.sub_list.currentRow()
-        if r >= 0: del self.subs[r]; self.rebuild()
-
-    def accept(self):
-        if not self.title.text().strip(): self.title.setFocus(); return
-        super().accept()
-
-    def apply(self, task):
-        task.update(title=self.title.text().strip(), priority=self.pri.currentData(),
-                    dueDate=self.date.date().toString("yyyy-MM-dd") if self.has_date.isChecked() else "", subs=self.subs, updatedAt=now_iso())
-
-
 class QuickAdd(QDialog):
     """Floating quick-add window: type once, see the parsed priority / labels / due date live.
     Enter saves into the chosen column; Shift+Enter (or 'Full form') opens TaskDialog pre-filled."""
@@ -979,6 +1041,7 @@ class QuickAdd(QDialog):
         if p["dueDate"]: self.chips.addWidget(badge("📅 " + fmt_date(p["dueDate"]), "#8890b0"))
         for l in (x for x in s.labels if x["id"] in p["labels"]): self.chips.addWidget(badge(l["name"], "#ffffff", l["color"]))
         for n in p.get("new", []): self.chips.addWidget(badge("+ " + n, "#8890b0"))
+        if p.get("repeat"): self.chips.addWidget(badge("↻ " + p["repeat"], "#b48aff"))
         t = QLabel(p["title"] or "Title…", objectName="muted2"); t.setStyleSheet("font-weight:600;"); self.chips.addWidget(t); self.chips.addStretch()
 
     def save(self):
@@ -1002,7 +1065,7 @@ class Palette(QDialog):
     def commands(self):
         w = self.win; light = w.appearance.get("theme") == "light"
         cmds = [("＋", "New task", "Ctrl N", lambda: w.add_task()), ("⚡", "Quick add", "!high #label @fri", lambda: QuickAdd(w).exec()), ("◈", "Go to Dashboard", "Alt 1", lambda: w.show_page("dashboard")), ("⊞", "Go to Task Board", "Alt 2", lambda: w.show_page("kanban")),
-                ("☑", "Go to Task Checklist", "Alt 3", lambda: w.show_page("checklist")), ("▦", "Go to Calendar", "Alt 4", lambda: w.show_page("calendar")),
+                ("☰", "Go to Task List", "Alt 3", lambda: w.show_page("list")), ("▦", "Go to Calendar", "Alt 4", lambda: w.show_page("calendar")),
                 ("📍", "Jump to today", f"{MONTHS_LONG[dt.date.today().month - 1]} {dt.date.today().year}", w.go_today),
                 ("🌙" if light else "☀️", "Switch to dark theme" if light else "Switch to light theme", "", w.toggle_theme),
                 ("⬇", "Export to Excel", "", w.export_excel), ("🔄", "Month rollover", "", w.open_rollover), ("🏷", "Manage labels", "", w.manage_labels), ("🎨", "Appearance", "", w.open_appearance),
@@ -1023,11 +1086,6 @@ class Palette(QDialog):
                         sc = score(k.get("title", ""), k.get("desc", ""), k.get("subs", []))
                         if sc: out.append(dict(icon="✓" if k.get("done") else "○", text=k["title"], meta=f"{MONTHS[mi]} {y} · {c['label']}", score=sc + 0.5 * ((y, mi) == cur) + 0.2 * (not k.get("done")),
                                               ts=k.get("updatedAt") or k.get("createdAt") or "", run=lambda y=y, mi=mi, kid=k["id"], cid=c["id"]: w.goto(y, mi, "kanban", lambda: w.open_detail(kid, cid))))
-                for g in s.checklist(mi, y):
-                    for t in g["tasks"]:
-                        sc = score(t.get("title", ""))
-                        if sc: out.append(dict(icon="☑" if t.get("done") else "☐", text=t["title"], meta=f"{MONTHS[mi]} {y} · {g['name']}", score=sc + 0.5 * ((y, mi) == cur), ts="",
-                                              run=lambda y=y, mi=mi, gg=g, tt=t: w.goto(y, mi, "checklist", lambda: w.cl_edit(gg, tt))))
         out.sort(key=lambda i: i["ts"], reverse=True); out.sort(key=lambda i: -i["score"]); return out
 
     def render(self, q):
@@ -1053,7 +1111,7 @@ class ExportDialog(QDialog):
         g = QGridLayout(); self.checks = []
         for i, m in enumerate(MONTHS):
             cb = QCheckBox(m); cb.setChecked(i == store.month)
-            kd = store.kanban(i); has = any(kd.get(c["id"]) for c in store.columns) or any(gr["tasks"] for gr in store.checklist(i))
+            kd = store.kanban(i); has = any(kd.get(c["id"]) for c in store.columns)
             if has: cb.setText(m + " •")
             g.addWidget(cb, i // 4, i % 4); self.checks.append(cb)
         v.addLayout(g)
@@ -1063,10 +1121,9 @@ class ExportDialog(QDialog):
             b = QPushButton(txt); b.clicked.connect(fn); r.addWidget(b)
         r.addStretch(); v.addLayout(r)
         self.inc_board = QCheckBox("Board tasks (with sub-tasks)"); self.inc_board.setChecked(True)
-        self.inc_cl = QCheckBox("Checklist groups & tasks"); self.inc_cl.setChecked(True)
         self.inc_sum = QCheckBox("Month-wise summary sheet"); self.inc_sum.setChecked(True)
         self.inc_done = QCheckBox("Include completed tasks"); self.inc_done.setChecked(True)
-        for cb in (self.inc_board, self.inc_cl, self.inc_sum, self.inc_done): v.addWidget(cb)
+        for cb in (self.inc_board, self.inc_sum, self.inc_done): v.addWidget(cb)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); bb.button(QDialogButtonBox.Ok).setText("Export…"); bb.button(QDialogButtonBox.Ok).setObjectName("primary")
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); v.addWidget(bb)
 
@@ -1074,7 +1131,7 @@ class ExportDialog(QDialog):
         return [i for i, c in enumerate(self.checks) if c.isChecked()]
 
 
-def export_excel(store, path, months, inc_board, inc_cl, inc_sum, inc_done):
+def export_excel(store, path, months, inc_board, inc_sum, inc_done):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     wb = Workbook(); wb.remove(wb.active)
@@ -1088,41 +1145,23 @@ def export_excel(store, path, months, inc_board, inc_cl, inc_sum, inc_done):
                 cards = [x for x in kd.get(c["id"], []) if inc_done or not x.get("done")]
                 if not cards or (c["id"] == "done" and not inc_done): continue
                 ws.append([]); ws.append([f"{c.get('icon', '')} {c['label'].upper()}"]); ws.cell(ws.max_row, 1).font = Font(bold=True, color=c["color"].lstrip("#"))
-                ws.append(["#", "Task Title", "Description", "Labels", "Priority", "Due Date", "Status", "Migrated From", "Sub-tasks", "Done/Total", "Created"])
+                ws.append(["#", "Task Title", "Description", "Labels", "Priority", "Due Date", "Repeat", "Status", "Migrated From", "Sub-tasks", "Done/Total", "Created"])
                 for cell in ws[ws.max_row]: cell.font = hdr; cell.fill = fill
                 for n, x in enumerate(cards, 1):
                     subs = x.get("subs", []); sd = sum(1 for s in subs if s.get("done"))
-                    ws.append([n, x["title"], x.get("desc", ""), lname(x), PRI_LABEL[x.get("priority", "med")], x.get("dueDate", ""),
+                    ws.append([n, x["title"], x.get("desc", ""), lname(x), PRI_LABEL[x.get("priority", "med")], x.get("dueDate", ""), x.get("repeat", ""),
                                "Completed" if x.get("done") or c["id"] == "done" else c["label"], x.get("migratedFrom", ""),
                                " | ".join(("[✓] " if s.get("done") else "[ ] ") + s["text"] for s in subs), f"{sd}/{len(subs)}" if subs else "", (x.get("createdAt") or "")[:10]])
-            for col, w in zip("ABCDEFGHIJK", (4, 30, 28, 16, 10, 12, 12, 13, 36, 10, 12)): ws.column_dimensions[col].width = w
-    if inc_cl:
-        for mi in months:
-            groups = store.checklist(mi)
-            if not groups: continue
-            ws = wb.create_sheet(f"{MONTHS[mi]}-Checklist"); ws.append([f"{APP_NAME} — Checklists — {MONTHS[mi]} {store.year}"]); ws["A1"].font = title
-            for g in groups:
-                tasks = [t for t in g["tasks"] if inc_done or not t.get("done")]
-                if not tasks: continue
-                done = sum(1 for t in g["tasks"] if t.get("done")); tot = len(g["tasks"])
-                ws.append([]); ws.append([f"📂 {g['name'].upper()}", "", f"{done}/{tot} done ({round(done / tot * 100) if tot else 0}%)"]); ws.cell(ws.max_row, 1).font = Font(bold=True)
-                ws.append(["#", "Task Title", "Priority", "Due Date", "Status", "Sub-tasks", "Done/Total"])
-                for cell in ws[ws.max_row]: cell.font = hdr; cell.fill = fill
-                for n, t in enumerate(tasks, 1):
-                    subs = t.get("subs", []); sd = sum(1 for s in subs if s.get("done"))
-                    ws.append([n, t["title"], PRI_LABEL[t.get("priority", "med")], t.get("dueDate", ""), "Done" if t.get("done") else "Pending",
-                               " | ".join(("[✓] " if s.get("done") else "[ ] ") + s["text"] for s in subs), f"{sd}/{len(subs)}" if subs else ""])
-            for col, w in zip("ABCDEFG", (4, 34, 10, 12, 11, 38, 10)): ws.column_dimensions[col].width = w
+            for col, w in zip("ABCDEFGHIJKL", (4, 30, 28, 16, 10, 12, 10, 12, 13, 36, 10, 12)): ws.column_dimensions[col].width = w
     if inc_sum:
         ws = wb.create_sheet("Summary"); ws.append([f"{APP_NAME} — Month-wise Summary — {store.year}"]); ws["A1"].font = title; ws.append([])
-        ws.append(["Month", "Year", "To Do", "Today's", "In Progress", "Completed", "Total", "Completion %", "CL Groups", "CL Tasks", "CL Done", "CL %"])
+        ws.append(["Month", "Year", "To Do", "Today's", "In Progress", "Completed", "Total", "Completion %"])
         for cell in ws[ws.max_row]: cell.font = hdr; cell.fill = fill
         ip = [c["id"] for c in store.columns if c["id"] not in ("todo", "today", "done")]
         for mi in range(12):
             kd = store.kanban(mi); todo, today, done = len(kd.get("todo", [])), len(kd.get("today", [])), len(kd.get("done", []))
             wip = sum(len(kd.get(i, [])) for i in ip); tot = todo + today + wip + done
-            gs = store.checklist(mi); ct = sum(len(g["tasks"]) for g in gs); cd = sum(1 for g in gs for t in g["tasks"] if t.get("done"))
-            ws.append([MONTHS[mi], store.year, todo, today, wip, done, tot, f"{round(done / tot * 100) if tot else 0}%", len(gs), ct, cd, f"{round(cd / ct * 100) if ct else 0}%"])
+            ws.append([MONTHS[mi], store.year, todo, today, wip, done, tot, f"{round(done / tot * 100) if tot else 0}%"])
     if not wb.sheetnames: wb.create_sheet("Empty").append(["Nothing selected"])
     wb.save(path)
 
@@ -1133,9 +1172,10 @@ def export_excel(store, path, months, inc_board, inc_cl, inc_sum, inc_done):
 class MainWindow(QMainWindow):
     def __init__(self, store):
         super().__init__(); self.store = store; self.setWindowTitle(APP_NAME); self.resize(1400, 880); self.setMinimumSize(980, 620)
-        self.detail_ref = None; self.filter_q = ""; self.filter_pri = ""; self.filter_labels = set(); self.cl_filter = "all"; self.cl_q = ""
+        self.detail_ref = None; self.filter_q = ""; self.filter_pri = ""; self.filter_labels = set()
         self.settings = read_settings(); self.appearance = {**dict(theme="dark", font="", size=13, text="", accent="", bg="", surface="", motion=True), **self.settings.get("appearance", {}), **self.store.db["meta"].get("appearance_py", {})}
         self._build(); self.apply_appearance(); self._tray(); self.show_page("dashboard")
+        if store.merged_count: QTimer.singleShot(800, lambda: self.toast(f"Checklist merged into the board: {store.merged_count} tasks now carry their group as a label. A backup of the old file was saved first.", 7000))
         moved = self.store.auto_migrate()
         if moved:
             self.toast(f"🔄 {moved} incomplete task(s) auto-moved to the next month"); self.refresh()
@@ -1145,7 +1185,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+K"), self, activated=lambda: Palette(self).exec())
         QShortcut(QKeySequence("["), self, activated=lambda: self.step_month(-1)); QShortcut(QKeySequence("]"), self, activated=lambda: self.step_month(1))
         QShortcut(QKeySequence("?"), self, activated=self.open_shortcuts)
-        for i, k in enumerate(("dashboard", "kanban", "checklist", "calendar")): QShortcut(QKeySequence(f"Alt+{i + 1}"), self, activated=lambda k=k: self.show_page(k))
+        for i, k in enumerate(("dashboard", "kanban", "list", "calendar")): QShortcut(QKeySequence(f"Alt+{i + 1}"), self, activated=lambda k=k: self.show_page(k))
 
     # ---------- layout ----------
     def _build(self):
@@ -1154,7 +1194,7 @@ class MainWindow(QMainWindow):
         b = QLabel(APP_NAME); b.setObjectName("brand"); b.setContentsMargins(20, 0, 0, 0); sv.addWidget(b)
         bs = QLabel("PLAN · DO · TRACK"); bs.setObjectName("brandSub"); bs.setContentsMargins(20, 0, 0, 14); sv.addWidget(bs)
         sv.addWidget(QLabel("WORKSPACE", objectName="navSection", indent=20)); self.nav_btns = {}
-        for key, txt in (("dashboard", "◈  Dashboard"), ("kanban", "⊞  Task Board"), ("checklist", "☑  Task Checklist"), ("calendar", "▦  Calendar")):
+        for key, txt in (("dashboard", "◈  Dashboard"), ("kanban", "⊞  Task Board"), ("list", "☰  Task List"), ("calendar", "▦  Calendar")):
             nb = QPushButton(txt); nb.setObjectName("nav"); nb.setCheckable(True); nb.clicked.connect(lambda _, k=key: self.show_page(k)); sv.addWidget(nb); self.nav_btns[key] = nb
         sv.addSpacing(10); sv.addWidget(QLabel("TOOLS", objectName="navSection", indent=20))
         self.roll_btn = QPushButton("🔄  Month Rollover"); self.roll_btn.setObjectName("nav"); self.roll_btn.clicked.connect(self.open_rollover); sv.addWidget(self.roll_btn)
@@ -1177,7 +1217,7 @@ class MainWindow(QMainWindow):
         th.addWidget(self.theme_btn); th.addWidget(ex); th.addWidget(ad); main.addWidget(tb)
         self.stack = QStackedWidget(); main.addWidget(self.stack, 1)
         self.pages = {}
-        for key, build in (("dashboard", self._build_dashboard), ("kanban", self._build_board), ("checklist", self._build_checklist), ("calendar", self._build_calendar)):
+        for key, build in (("dashboard", self._build_dashboard), ("kanban", self._build_board), ("list", self._build_list), ("calendar", self._build_calendar)):
             self.pages[key] = build(); self.stack.addWidget(self.pages[key])
         w = QWidget(); w.setLayout(main); h.addWidget(w, 1)
         # detail dock
@@ -1209,19 +1249,19 @@ class MainWindow(QMainWindow):
         self.pri_filter.currentIndexChanged.connect(lambda: (setattr(self, "filter_pri", self.pri_filter.currentData()), self.render_board()))
         self.label_bar = QHBoxLayout(); tbar.addWidget(self.search); tbar.addWidget(self.pri_filter); tbar.addLayout(self.label_bar); tbar.addStretch()
         lb = QPushButton("🏷 Labels"); lb.clicked.connect(self.manage_labels); cb = QPushButton("+ Column"); cb.clicked.connect(lambda: self.column_dialog(None)); tbar.addWidget(lb); tbar.addWidget(cb); v.addLayout(tbar)
-        self.board_host = QWidget(); self.board_layout = QHBoxLayout(self.board_host); self.board_layout.setContentsMargins(0, 0, 0, 0); self.board_layout.setSpacing(14); self.board_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.board_host = QWidget(); self.board_layout = QHBoxLayout(self.board_host); self.board_layout.setContentsMargins(0, 0, 0, 0); self.board_layout.setSpacing(12); self.board_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         sa = QScrollArea(); sa.setWidgetResizable(True); sa.setWidget(self.board_host); v.addWidget(sa, 1)
         return w
 
-    def _build_checklist(self):
-        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(24, 14, 24, 14); v.setSpacing(12)
-        tb = QHBoxLayout(); self.cl_btns = {}
-        for k, t in (("all", "All"), ("pending", "Pending"), ("done", "Done")):
-            b = QPushButton(t); b.setCheckable(True); b.setChecked(k == "all"); b.clicked.connect(lambda _, k=k: self.set_cl_filter(k)); tb.addWidget(b); self.cl_btns[k] = b
-        self.cl_search = QLineEdit(); self.cl_search.setPlaceholderText("Search tasks…"); self.cl_search.setFixedWidth(240); self.cl_search.textChanged.connect(lambda t: (setattr(self, "cl_q", t), self.render_checklist()))
-        tb.addWidget(self.cl_search); tb.addStretch(); ng = QPushButton("+ New Group"); ng.setObjectName("primary"); ng.clicked.connect(self.add_group); tb.addWidget(ng); v.addLayout(tb)
-        self.cl_host = QWidget(); self.cl_layout = QVBoxLayout(self.cl_host); self.cl_layout.setAlignment(Qt.AlignTop); self.cl_layout.setSpacing(12)
-        v.addWidget(self._scroll(self.cl_host), 1); return w
+    def _build_list(self):
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(24, 14, 24, 14); v.setSpacing(12); tb = QHBoxLayout()
+        tb.addWidget(QLabel("Group by", objectName="muted")); self.list_group = QComboBox()
+        for k, t in (("column", "Column"), ("due", "Due date"), ("label", "Label"), ("priority", "Priority")): self.list_group.addItem(t, k)
+        self.list_group.currentIndexChanged.connect(self.render_list); tb.addWidget(self.list_group)
+        self.list_search = QLineEdit(); self.list_search.setPlaceholderText("Search tasks…"); self.list_search.setFixedWidth(240); self.list_search.textChanged.connect(self.render_list); tb.addWidget(self.list_search)
+        self.list_hide_done = QCheckBox("Hide completed"); self.list_hide_done.toggled.connect(self.render_list); tb.addWidget(self.list_hide_done)
+        self.list_stat = QLabel(objectName="muted"); tb.addWidget(self.list_stat); tb.addStretch(); tb.addWidget(QLabel("Same tasks as the board · tick = done · click a row to open", objectName="muted")); v.addLayout(tb)
+        self.list_host = QWidget(); self.list_layout = QVBoxLayout(self.list_host); self.list_layout.setAlignment(Qt.AlignTop); self.list_layout.setSpacing(6); v.addWidget(self._scroll(self.list_host), 1); return w
 
     def _build_calendar(self):
         w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(24, 14, 24, 14); v.setSpacing(12); tb = QHBoxLayout()
@@ -1304,18 +1344,18 @@ class MainWindow(QMainWindow):
     def show_page(self, key):
         changed = getattr(self, "page", None) != key; self.page = key
         for k, b in self.nav_btns.items(): b.setChecked(k == key)
-        self.stack.setCurrentWidget(self.pages[key]); self.page_title.setText({"dashboard": "Dashboard", "kanban": "Task Board", "checklist": "Task Checklist", "calendar": "Calendar"}[key]); self.refresh()
+        self.stack.setCurrentWidget(self.pages[key]); self.page_title.setText({"dashboard": "Dashboard", "kanban": "Task Board", "list": "Task List", "calendar": "Calendar"}[key]); self.refresh()
         if changed: self.fade_in(self.pages[key])
 
     def refresh(self):
         s = self.store; self.page_month.setText(f"{MONTHS_LONG[s.month]} {s.year}"); self.year_lbl.setText(str(s.year))
         for i, b in enumerate(self.month_btns): b.setChecked(i == s.month)
-        kd = s.kanban(); n = sum(len(kd.get(c["id"], [])) for c in s.columns); ncl = sum(len(g["tasks"]) for g in s.checklist())
-        self.nav_btns["kanban"].setText(f"⊞  Task Board   ({n})"); self.nav_btns["checklist"].setText(f"☑  Task Checklist   ({ncl})")
+        kd = s.kanban(); n = sum(len(kd.get(c["id"], [])) for c in s.columns); nopen = sum(1 for c in s.columns if c["id"] != "done" for x in kd.get(c["id"], []) if not x.get("done"))
+        self.nav_btns["kanban"].setText(f"⊞  Task Board   ({n})"); self.nav_btns["list"].setText(f"☰  Task List   ({nopen} open)")
         self.overdue_n = sum(1 for c in s.columns if c["id"] != "done" for x in kd.get(c["id"], []) if is_overdue(x.get("dueDate"), x.get("done")))
         self.nav_btns["calendar"].setText("▦  Calendar" + (f"   (⚠ {self.overdue_n})" if self.overdue_n else ""))
         self.roll_btn.setText("🔄  Month Rollover" + ("  ⚠" if s.pending_rollover() else ""))
-        {"dashboard": self.render_dashboard, "kanban": self.render_board, "checklist": self.render_checklist, "calendar": self.render_calendar}[self.page]()
+        {"dashboard": self.render_dashboard, "kanban": self.render_board, "list": self.render_list, "calendar": self.render_calendar}[self.page]()
         if self.detail_ref: self.render_detail()
 
     def switch_month(self, i):
@@ -1342,9 +1382,9 @@ class MainWindow(QMainWindow):
         if then: then()
 
     def open_shortcuts(self):
-        QMessageBox.information(self, "Keyboard shortcuts", "Ctrl K\tSearch & commands\nCtrl N\tNew task\n[  ]\tPrevious / next month\nAlt 1–4\tDashboard · Board · Checklist · Calendar\n"
+        QMessageBox.information(self, "Keyboard shortcuts", "Ctrl K\tSearch & commands\nCtrl N\tNew task\n[  ]\tPrevious / next month\nAlt 1–4\tDashboard · Board · List · Calendar\n"
                                 "Enter\tQuick-add: save task\nShift Enter\tQuick-add: open full form\nCtrl Enter\tSave the open form\n?\tThis sheet\nCtrl Shift B\tBackup now\n\n"
-                                "Quick-add syntax:  !high / !low priority  ·  #label assigns (or creates) a label  ·  @today @tomorrow @fri @15 @+3 @2026-10-01 due date")
+                                "Quick-add syntax:  !high / !low priority  ·  #label assigns (or creates) a label  ·  @today @tomorrow @fri @15 @+3 @2026-10-01 due date  ·  *daily *weekdays *weekly *monthly *yearly repeat")
 
     @staticmethod
     def _clear(layout):
@@ -1375,10 +1415,6 @@ class MainWindow(QMainWindow):
             for k in kd.get(c["id"], []) if c["id"] != "done" else []:
                 df = days_to(k["dueDate"]) if k.get("dueDate") and not k.get("done") else None
                 if df is not None and df <= 7: items.append((df, k.get("priority") != "high", k["title"], c["color"], lambda cid=k["id"], col=c["id"]: (self.show_page("kanban"), self.open_detail(cid, col))))
-        for g in s.checklist():
-            for t in g["tasks"]:
-                df = days_to(t["dueDate"]) if t.get("dueDate") and not t.get("done") else None
-                if df is not None and df <= 7: items.append((df, t.get("priority") != "high", "☑ " + t["title"], "#b48aff", lambda gg=g, tt=t: (self.show_page("checklist"), self.cl_edit(gg, tt))))
         items.sort(key=lambda x: x[:2]); over = sum(1 for i in items if i[0] < 0)
         self.attn_sub.setText(f"{over} overdue · {len(items) - over} due this week" if items else "")
         if not items: self.attn_box.addWidget(QLabel("Nothing is overdue or due in the next 7 days. Add due dates to tasks and they show up here.", objectName="muted", wordWrap=True))
@@ -1419,7 +1455,7 @@ class MainWindow(QMainWindow):
             b.toggled.connect(lambda on, lid=l["id"]: (self.filter_labels.add(lid) if on else self.filter_labels.discard(lid), self.render_board())); self.label_bar.addWidget(b)
         self._clear(self.board_layout); kd = s.kanban()
         for col in s.columns:
-            cw = QWidget(); cw.setFixedWidth(280); cv = QVBoxLayout(cw); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(8)
+            cw = QWidget(); cw.setMinimumWidth(176); cw.setMaximumWidth(380); cv = QVBoxLayout(cw); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(8)
             head = QFrame(); head.setObjectName("colhead"); hh = QHBoxLayout(head); hh.setContentsMargins(12, 8, 8, 8)
             dot = QLabel("●"); dot.setStyleSheet(f"color:{col['color']};"); t = QLabel(f"{col.get('icon', '')} {col['label']}"); t.setStyleSheet("font-weight:700;")
             pal = self.palette_dict(); cnt = badge(str(len(kd.get(col["id"], []))), pal["text2"], pal["s4"]); mb = QPushButton("…"); mb.setObjectName("ghost"); mb.setFixedWidth(26); mb.clicked.connect(lambda _, cid=col["id"]: self.column_dialog(cid))
@@ -1434,8 +1470,8 @@ class MainWindow(QMainWindow):
                 it = QListWidgetItem(); it.setData(Qt.UserRole, c["id"]); w = CardWidget(s, c, col); it.setSizeHint(w.sizeHint() + QSize(0, 6)); lst.addItem(it); lst.setItemWidget(it, w)
                 w.clicked.connect(self.open_detail); w.edit.connect(self.edit_task); w.delete.connect(self.delete_task); w.toggle.connect(self.toggle_done)
             lst.fit_items(); cv.addWidget(lst, 1)
-            ab = QPushButton("+ Add Task"); ab.setObjectName("addk"); ab.setToolTip("New task in this column  ·  Ctrl K → Quick add for the !high #label @fri syntax"); ab.clicked.connect(lambda _, cid=col["id"]: self.add_task(cid)); cv.addWidget(ab); self.board_layout.addWidget(cw)
-        addc = QPushButton("+ Add column"); addc.setObjectName("addk"); addc.setFixedWidth(200); addc.clicked.connect(lambda: self.column_dialog(None)); self.board_layout.addWidget(addc, 0, Qt.AlignTop)
+            ab = QPushButton("+ Add Task"); ab.setObjectName("addk"); ab.setToolTip("New task in this column  ·  Ctrl K → Quick add for the !high #label @fri syntax"); ab.clicked.connect(lambda _, cid=col["id"]: self.add_task(cid)); cv.addWidget(ab); self.board_layout.addWidget(cw, 1)
+        addc = QPushButton("+"); addc.setObjectName("addk"); addc.setFixedWidth(44); addc.setToolTip("Add column"); addc.clicked.connect(lambda: self.column_dialog(None)); self.board_layout.addWidget(addc, 0, Qt.AlignTop)
 
     def on_drop(self, cid, from_col, to_col, before):
         if before == cid: return
@@ -1443,11 +1479,12 @@ class MainWindow(QMainWindow):
         if card:
             self.store.save(); self.refresh()
             if self.detail_ref and self.detail_ref[0] == cid: self.detail_ref = (cid, to_col); self.render_detail()
-            if to_col == "done" and from_col != "done": self.toast("✅ Task completed!")
+            if card.pop("recurred", False): self.toast(f"↻ Done for now — next due {fmt_date(card['dueDate'])}")
+            elif to_col == "done" and from_col != "done": self.toast("✅ Task completed!")
 
-    def _create_card(self, col_id, title, priority="med", dueDate="", labels=None, desc="", subs=None):
+    def _create_card(self, col_id, title, priority="med", dueDate="", labels=None, desc="", subs=None, repeat="", repeatUntil=""):
         s = self.store; card = dict(id=uid(), title=title, desc=desc, priority=priority, dueDate=dueDate, done=col_id == "done", subs=subs or [], labels=labels or [],
-                                    comments=[], activity=[], createdAt=now_iso(), month=MONTHS[s.month], year=s.year)
+                                    repeat=repeat, repeatUntil=repeatUntil, comments=[], activity=[], createdAt=now_iso(), month=MONTHS[s.month], year=s.year)
         s.log(card, f"Created in {s.col(col_id)['label']}"); s.kanban().setdefault(col_id, []).insert(0, card); s.save(); self.refresh(); return card
 
     def add_task(self, col_id="todo", preset=None):
@@ -1466,8 +1503,8 @@ class MainWindow(QMainWindow):
         if not card: return
         d = TaskDialog(self, self.store, card, col_id)
         if d.exec() != QDialog.Accepted: return
-        v = d.values(); changes = [n for n, k in (("title", "title"), ("description", "desc"), ("priority", "priority"), ("due date", "dueDate")) if (card.get(k) or "") != v[k]]
-        card.update(title=v["title"], desc=v["desc"], priority=v["priority"], dueDate=v["dueDate"], subs=v["subs"], labels=v["labels"], updatedAt=now_iso())
+        v = d.values(); changes = [n for n, k in (("title", "title"), ("description", "desc"), ("priority", "priority"), ("due date", "dueDate"), ("repeat", "repeat")) if (card.get(k) or "") != v[k]]
+        card.update(title=v["title"], desc=v["desc"], priority=v["priority"], dueDate=v["dueDate"], subs=v["subs"], labels=v["labels"], repeat=v["repeat"], repeatUntil=v["repeatUntil"], updatedAt=now_iso())
         if changes: self.store.log(card, "Edited " + ", ".join(changes))
         if v["col"] != col_id: self.store.move_card(cid, col_id, v["col"])
         elif v["col"] == "done": card["done"] = True
@@ -1481,11 +1518,19 @@ class MainWindow(QMainWindow):
         self.store.save(); self.refresh()
 
     def toggle_done(self, cid, col_id):
-        to = "done" if col_id != "done" else "todo"
-        if self.store.move_card(cid, col_id, to):
-            self.store.save()
-            if self.detail_ref and self.detail_ref[0] == cid: self.detail_ref = (cid, to)
-            self.refresh(); self.toast("✅ Moved to Completed!" if to == "done" else "↩ Moved to To Do")
+        to = "done" if col_id != "done" else "todo"; card = self.store.move_card(cid, col_id, to)
+        if card:
+            self.store.save(); rec = card.pop("recurred", False)
+            if self.detail_ref and self.detail_ref[0] == cid: self.detail_ref = (cid, col_id if rec else to)
+            self.refresh(); self.toast(f"↻ Done for now — next due {fmt_date(card['dueDate'])}" if rec else "✅ Moved to Completed!" if to == "done" else "↩ Moved to To Do")
+
+    def skip_occurrence(self, cid, col_id):
+        card, _ = self.store.find_card(cid, col_id)
+        if not card or not card.get("repeat") or not card.get("dueDate"): return
+        nd = next_due(card["dueDate"], card["repeat"])
+        if nd is None or (card.get("repeatUntil") and nd.isoformat() > card["repeatUntil"]): card["repeat"] = ""; self.toast("Repeat ended")
+        else: self.store.log(card, f"Skipped {fmt_date(card['dueDate'])} → {fmt_date(nd.isoformat())}"); card["dueDate"] = nd.isoformat(); self.toast(f"Skipped — next due {fmt_date(card['dueDate'])}")
+        card["updatedAt"] = now_iso(); self.store.save(); self.refresh()
 
     def manage_labels(self):
         LabelDialog(self, self.store).exec(); self.filter_labels &= {l["id"] for l in self.store.labels}; self.refresh()
@@ -1512,13 +1557,22 @@ class MainWindow(QMainWindow):
         s.save(); self.refresh()
 
     # ---------- detail panel ----------
+    DOCK_W = 440
+
     def open_detail(self, cid, col_id):
         card, col_id = self.store.find_card(cid, col_id)
         if not card: return
-        self.detail_ref = (cid, col_id); self.render_detail(); self.dock.show()
+        self.detail_ref = (cid, col_id); self.render_detail()
+        if self.dock.isVisible(): return
+        self.dock.show()
+        if self.motion():       # the board reflows as the pane slides in (setMaximumWidth also lowers the minimum while below it)
+            self.dock.setMaximumWidth(1); self.animate(self.dock, b"maximumWidth", 1, self.DOCK_W, 260, on_done=lambda: (self.dock.setMaximumWidth(16777215), self.dock.setMinimumWidth(self.DOCK_W)))
 
     def close_detail(self):
-        self.detail_ref = None; self.dock.hide()
+        self.detail_ref = None
+        if self.dock.isVisible() and self.motion():
+            self.animate(self.dock, b"maximumWidth", self.dock.width(), 1, 200, QEasingCurve.InCubic, on_done=lambda: (self.dock.hide(), self.dock.setMaximumWidth(16777215), self.dock.setMinimumWidth(self.DOCK_W)))
+        else: self.dock.hide()
 
     def _dcard(self):
         if not self.detail_ref: return None, None
@@ -1532,6 +1586,7 @@ class MainWindow(QMainWindow):
         inner = QWidget(); v = QVBoxLayout(inner); v.setContentsMargins(20, 16, 20, 16); v.setSpacing(12)
         top = QHBoxLayout(); top.addWidget(badge(f"{col.get('icon', '')} {col['label']}", "#fff", col["color"])); top.addWidget(badge(PRI_LABEL[card.get("priority", "med")], PRI_COLOR[card.get("priority", "med")]))
         if card.get("dueDate"): od = is_overdue(card["dueDate"], done); top.addWidget(badge(("⚠ Overdue " if od else "📅 ") + fmt_date(card["dueDate"]), "#ff6584" if od else "#8890b0"))
+        if card.get("repeat"): top.addWidget(badge("↻ " + REPEAT_SHORT.get(card["repeat"], card["repeat"]), "#b48aff"))
         top.addStretch(); cl = QPushButton("✕"); cl.setObjectName("ghost"); cl.clicked.connect(self.close_detail); top.addWidget(cl); v.addLayout(top)
         title = QLineEdit(card["title"]); title.setStyleSheet("font-size:17px;font-weight:700;background:transparent;border-color:transparent;"); title.editingFinished.connect(lambda: self.dset("title", title.text())); v.addWidget(title)
         g = QGridLayout(); colc = QComboBox()
@@ -1540,11 +1595,20 @@ class MainWindow(QMainWindow):
         pri = QComboBox()
         for k, lab in PRI_LABEL.items(): pri.addItem(lab, k)
         pri.setCurrentIndex(pri.findData(card.get("priority", "med"))); pri.currentIndexChanged.connect(lambda: self.dset("priority", pri.currentData()))
-        dcb = QCheckBox("Due"); de = QDateEdit(QDate.currentDate()); de.setCalendarPopup(True); de.setDisplayFormat("yyyy-MM-dd")
+        dcb = QCheckBox("Due"); de = QDateEdit(QDate.currentDate()); de.setCalendarPopup(True); de.setDisplayFormat("yyyy-MM-dd"); de.setMinimumWidth(150)
         if card.get("dueDate"): dcb.setChecked(True); de.setDate(QDate.fromString(card["dueDate"], "yyyy-MM-dd"))
         de.setEnabled(dcb.isChecked()); dcb.toggled.connect(lambda on: self.dset("dueDate", de.date().toString("yyyy-MM-dd") if on else "")); de.dateChanged.connect(lambda d: self.dset("dueDate", d.toString("yyyy-MM-dd")) if dcb.isChecked() else None)
         for i, (lab, w) in enumerate((("Column", colc), ("Priority", pri))): g.addWidget(QLabel(lab, objectName="muted"), 0, i); g.addWidget(w, 1, i)
-        dl = QHBoxLayout(); dl.addWidget(dcb); dl.addWidget(de); dl.addStretch(); g.addWidget(QLabel("Due date", objectName="muted"), 2, 0); g.addLayout(dl, 3, 0, 1, 2); v.addLayout(g)
+        dl = QHBoxLayout(); dl.addWidget(dcb); dl.addWidget(de); dl.addStretch(); g.addWidget(QLabel("Due date", objectName="muted"), 2, 0); g.addLayout(dl, 3, 0, 1, 2)
+        rp = QComboBox()
+        for k, lab in REPEATS: rp.addItem(("↻ " if k else "") + lab, k)
+        rp.setCurrentIndex(max(0, rp.findData(card.get("repeat", "")))); rp.currentIndexChanged.connect(lambda: self.dset_repeat(rp.currentData()))
+        rl = QHBoxLayout(); rl.addWidget(rp)
+        if card.get("repeat"):
+            nd = next_due(card["dueDate"], card["repeat"]) if card.get("dueDate") else None
+            rl.addWidget(QLabel(("then " + fmt_date(nd.isoformat()) if nd else "") + (f" · until {fmt_date(card['repeatUntil'])}" if card.get("repeatUntil") else ""), objectName="muted"))
+            sk = QPushButton("Skip once"); sk.setObjectName("ghost"); sk.setToolTip("Move this task to its next occurrence without completing it"); sk.clicked.connect(lambda: self.skip_occurrence(card["id"], col_id)); rl.addWidget(sk)
+        rl.addStretch(); g.addWidget(QLabel("Repeat", objectName="muted"), 4, 0); g.addLayout(rl, 5, 0, 1, 2); v.addLayout(g)
         lh = QHBoxLayout(); lh.addWidget(QLabel("LABELS", objectName="navSection")); lh.addStretch(); mg = QPushButton("Manage"); mg.setObjectName("ghost"); mg.clicked.connect(self.manage_labels); lh.addWidget(mg); v.addLayout(lh)
         lr = QGridLayout(); lr.setSpacing(6)        # ponytail: 3 chips per row instead of a flow layout; wraps within the 440 px dock
         for i, l in enumerate(s.labels):
@@ -1576,6 +1640,12 @@ class MainWindow(QMainWindow):
         ed = QPushButton("✎ Edit in form"); ed.clicked.connect(lambda: self.edit_task(card["id"], col_id)); dl2 = QPushButton("Delete"); dl2.setObjectName("danger"); dl2.clicked.connect(lambda: self.delete_task(card["id"], col_id))
         foot.addWidget(mk); foot.addWidget(ed); foot.addStretch(); foot.addWidget(dl2); L.addLayout(foot)
 
+    def dset_repeat(self, rep):
+        card, _ = self._dcard()
+        if not card: return
+        if rep and not card.get("dueDate"): card["dueDate"] = dt.date.today().isoformat()
+        self.dset("repeat", rep)
+
     def dset(self, field, val):
         card, col = self._dcard()
         if not card: return
@@ -1583,7 +1653,7 @@ class MainWindow(QMainWindow):
         if field == "title" and not val: self.render_detail(); return
         if (card.get(field) or "") == val: return
         card[field] = val; card["updatedAt"] = now_iso()
-        self.store.log(card, {"title": "Title updated", "desc": "Description updated", "priority": f"Priority set to {PRI_LABEL.get(val, val)}", "dueDate": f"Due date set to {fmt_date(val)}" if val else "Due date removed"}[field])
+        self.store.log(card, {"title": "Title updated", "desc": "Description updated", "priority": f"Priority set to {PRI_LABEL.get(val, val)}", "dueDate": f"Due date set to {fmt_date(val)}" if val else "Due date removed", "repeat": f"Repeats {dict(REPEATS).get(val, val).lower()}" if val else "Repeat removed"}[field])
         self.store.save(); self.refresh()
 
     def dmove(self, to):
@@ -1640,7 +1710,7 @@ class MainWindow(QMainWindow):
         s = self.store; y, m = s.year, s.month; self._clear(self.cal_grid); self._clear(self.cal_side)
         first = dt.date(y, m + 1, 1); start = first - dt.timedelta(days=first.weekday()); days_in = calendar.monthrange(y, m + 1)[1]
         cells = -(-(first.weekday() + days_in) // 7) * 7; end = start + dt.timedelta(days=cells - 1); today = dt.date.today().isoformat()
-        by_date, unscheduled, other = {}, [], []
+        by_date, unscheduled, other, nghost = {}, [], [], [0]
         def iso_date(v):
             try: return dt.date.fromisoformat(v) if v else None
             except ValueError: return None
@@ -1648,15 +1718,13 @@ class MainWindow(QMainWindow):
             for k in s.kanban().get(c["id"], []):
                 done = k.get("done") or c["id"] == "done"; d = iso_date(k.get("dueDate")); in_grid = d is not None and start <= d <= end
                 if not k.get("dueDate") and done: continue
-                chip = CalChip(("" if in_grid or not d else fmt_date(k["dueDate"]) + " · ") + k["title"], c["color"], k["id"], done, is_overdue(k.get("dueDate"), done),
+                chip = CalChip(("↻ " if k.get("repeat") else "") + ("" if in_grid or not d else fmt_date(k["dueDate"]) + " · ") + k["title"], c["color"], k["id"], done, is_overdue(k.get("dueDate"), done),
                                on_click=lambda kid=k["id"], cid=c["id"]: self.open_detail(kid, cid))
                 (unscheduled if not d else by_date.setdefault(k["dueDate"], []) if in_grid else other).append(chip)
-        for g in s.checklist():
-            for t in g["tasks"]:
-                d = iso_date(t.get("dueDate"))
-                if d is not None and start <= d <= end:
-                    by_date.setdefault(t["dueDate"], []).append(CalChip("☑ " + t["title"], "#b48aff", None, t.get("done"), is_overdue(t["dueDate"], t.get("done")), dashed=True, on_click=lambda gg=g, tt=t: self.cl_edit(gg, tt)))
-        self.cal_stat.setText(f"{sum(len(v) for v in by_date.values())} scheduled · {len(unscheduled)} unscheduled" + (f" · {len(other)} due in another month" if other else ""))
+                if not done:
+                    for od in occurrences(k, start, end):
+                        by_date.setdefault(od.isoformat(), []).append(CalChip("↻ " + k["title"], c["color"], None, dashed=True, ghost=True, on_click=lambda kid=k["id"], cid=c["id"]: self.open_detail(kid, cid))); nghost[0] += 1
+        self.cal_stat.setText(f"{sum(len(v) for v in by_date.values()) - nghost[0]} scheduled · {len(unscheduled)} unscheduled" + (f" · {nghost[0]} repeats" if nghost[0] else "") + (f" · {len(other)} due in another month" if other else ""))
         for i, dn in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
             self.cal_grid.addWidget(QLabel(dn, objectName="muted", alignment=Qt.AlignCenter), 0, i); self.cal_grid.setColumnStretch(i, 1)
         for i in range(cells):
@@ -1683,82 +1751,39 @@ class MainWindow(QMainWindow):
         card["dueDate"] = iso; card["updatedAt"] = now_iso(); self.store.log(card, f"Rescheduled to {fmt_date(iso)}" if iso else "Due date removed"); self.store.save(); self.refresh()
         self.toast(f"“{card['title']}” now due {fmt_date(iso)}" if iso else f"Due date cleared for “{card['title']}”")
 
-    # ---------- checklist ----------
-    def set_cl_filter(self, k):
-        self.cl_filter = k
-        for kk, b in self.cl_btns.items(): b.setChecked(kk == k)
-        self.render_checklist()
-
-    def render_checklist(self):
-        self._clear(self.cl_layout); s = self.store; groups = s.checklist()
-        if not groups: self.cl_layout.addWidget(QLabel("No checklist groups yet. Create one to get started.", objectName="muted"))
-        for g in groups:
-            tasks = g["tasks"]
-            if self.cl_filter == "pending": tasks = [t for t in tasks if not t.get("done")]
-            if self.cl_filter == "done": tasks = [t for t in tasks if t.get("done")]
-            if self.cl_q: tasks = [t for t in tasks if self.cl_q.lower() in t["title"].lower()]
-            f = QFrame(); f.setObjectName("group"); fv = QVBoxLayout(f); hr = QHBoxLayout()
-            tot = len(g["tasks"]); done = sum(1 for t in g["tasks"] if t.get("done")); pct = round(done / tot * 100) if tot else 0
-            hr.addWidget(QLabel(f"📂  {g['name']}", objectName="sectitle")); hr.addStretch(); hr.addWidget(QLabel(f"{done}/{tot} · {pct}%", objectName="muted"))
-            rn = QPushButton("✎"); rn.setObjectName("ghost"); rn.clicked.connect(lambda _, gg=g: self.rename_group(gg)); dl = QPushButton("🗑"); dl.setObjectName("ghost"); dl.clicked.connect(lambda _, gg=g: self.delete_group(gg)); hr.addWidget(rn); hr.addWidget(dl); fv.addLayout(hr)
-            if not tasks: fv.addWidget(QLabel("No tasks. Add one below.", objectName="muted"))
-            for t in tasks:
-                r = QHBoxLayout(); cb = QCheckBox(); cb.setChecked(bool(t.get("done"))); cb.clicked.connect(lambda _, gg=g, tt=t: self.cl_toggle(gg, tt))
-                body = QVBoxLayout(); tl = QLabel(t["title"]); tl.setStyleSheet("font-weight:500;" + ("text-decoration:line-through;color:#5c6382;" if t.get("done") else "")); body.addWidget(tl)
-                meta = QHBoxLayout(); meta.addWidget(badge(PRI_LABEL[t.get("priority", "med")], PRI_COLOR[t.get("priority", "med")]))
-                if t.get("dueDate"): od = is_overdue(t["dueDate"], t.get("done")); meta.addWidget(badge(("⚠ " if od else "📅 ") + fmt_date(t["dueDate"]), "#ff6584" if od else "#8890b0"))
-                subs = t.get("subs", [])
-                if subs: meta.addWidget(badge(f"{sum(1 for x in subs if x.get('done'))}/{len(subs)} subs", "#b48aff"))
-                if t.get("migratedFrom"): meta.addWidget(badge("↪ " + t["migratedFrom"], "#8890b0"))
-                meta.addStretch(); body.addLayout(meta)
-                for x in subs:
-                    scb = QCheckBox(x["text"]); scb.setChecked(bool(x.get("done"))); scb.setStyleSheet("margin-left:12px;"); scb.clicked.connect(lambda _, gg=g, tt=t, xx=x: self.cl_toggle_sub(gg, tt, xx)); body.addWidget(scb)
-                eb = QPushButton("✎"); eb.setObjectName("ghost"); eb.clicked.connect(lambda _, gg=g, tt=t: self.cl_edit(gg, tt)); xb = QPushButton("✕"); xb.setObjectName("ghost"); xb.clicked.connect(lambda _, gg=g, tt=t: self.cl_delete(gg, tt))
-                r.addWidget(cb, 0, Qt.AlignTop); r.addLayout(body, 1); r.addWidget(eb, 0, Qt.AlignTop); r.addWidget(xb, 0, Qt.AlignTop); fv.addLayout(r)
-            ar = QHBoxLayout(); inp = QLineEdit(); inp.setPlaceholderText("+ Add task… (Enter)"); inp.returnPressed.connect(lambda gg=g, ii=inp: self.cl_add(gg, ii.text())); ab = QPushButton("Add"); ab.setObjectName("primary"); ab.clicked.connect(lambda _, gg=g, ii=inp: self.cl_add(gg, ii.text())); ar.addWidget(inp); ar.addWidget(ab); fv.addLayout(ar)
-            self.cl_layout.addWidget(f)
-
-    def add_group(self):
-        name, ok = QInputDialog.getText(self, "New Checklist Group", "Group name:")
-        if ok and name.strip(): self.store.checklist().append({"id": uid(), "name": name.strip(), "tasks": []}); self.store.save(); self.refresh(); self.toast("Group created!")
-
-    def rename_group(self, g):
-        name, ok = QInputDialog.getText(self, "Rename Group", "Group name:", text=g["name"])
-        if ok and name.strip(): g["name"] = name.strip(); self.store.save(); self.refresh()
-
-    def delete_group(self, g):
-        if g["tasks"] and QMessageBox.question(self, "Delete group", f"Delete group \"{g['name']}\" and its {len(g['tasks'])} task(s)?") != QMessageBox.Yes: return
-        self.store.checklist().remove(g); self.store.save(); self.refresh()
-
-    def cl_add(self, g, t):
-        t = t.strip()
-        if t: g["tasks"].append({"id": uid(), "title": t, "done": False, "priority": "med", "dueDate": "", "subs": []}); self.store.save(); self.refresh()
-
-    def cl_toggle(self, g, t):
-        t["done"] = not t.get("done"); self.store.save(); self.refresh()
-        if t["done"]: self.toast("✅ Task done!")
-
-    def cl_toggle_sub(self, g, t, x):
-        x["done"] = not x.get("done")
-        if t["subs"] and all(s.get("done") for s in t["subs"]): t["done"] = True; self.toast("🎉 All sub-tasks done!")
-        self.store.save(); self.refresh()
-
-    def cl_edit(self, g, t):
-        d = ChecklistTaskDialog(self, t)
-        if d.exec() == QDialog.Accepted: d.apply(t); self.store.save(); self.refresh(); self.toast("Task updated")
-
-    def cl_delete(self, g, t):
-        g["tasks"].remove(t); self.store.save(); self.refresh()
+    # ---------- list (same cards as the board, one line each) ----------
+    def render_list(self, *_):
+        s = self.store; self._clear(self.list_layout); kd = s.kanban(); q = self.list_search.text().strip().lower(); hide = self.list_hide_done.isChecked(); mode = self.list_group.currentData(); today = dt.date.today()
+        rows = [(c, col) for col in s.columns for c in kd.get(col["id"], []) if not (hide and (c.get("done") or col["id"] == "done"))
+                and (not q or q in " ".join([c.get("title", ""), c.get("desc", "")] + [x["text"] for x in c.get("subs", [])]).lower())]
+        def key(c, col):
+            if mode == "column": return (s.columns.index(col), f"{col.get('icon', '')} {col['label']}", col["color"])
+            if mode == "priority": p = c.get("priority", "med"); return ({"high": 0, "med": 1, "low": 2}[p], PRI_LABEL[p], PRI_COLOR[p])
+            if mode == "label":
+                l = next((x for x in s.labels if x["id"] in c.get("labels", [])), None)
+                return (s.labels.index(l), l["name"], l["color"]) if l else (999, "No label", "#8890b0")
+            try: n = (dt.date.fromisoformat(c["dueDate"]) - today).days
+            except (KeyError, TypeError, ValueError): return (6, "No due date", "#8890b0")
+            if n < 0: return (0, "Overdue", "#ff6584") if not (c.get("done") or col["id"] == "done") else (5, "Past", "#8890b0")
+            return (1, "Today", "#ffb347") if n == 0 else (2, "Tomorrow", "#6c8aff") if n == 1 else (3, "This week", "#6c8aff") if n <= 6 else (4, "Next 30 days", "#8890b0") if n <= 30 else (5, "Later", "#8890b0")
+        groups = {}
+        for c, col in rows: groups.setdefault(key(c, col), []).append((c, col))
+        for (order, name, color) in sorted(groups):
+            items = groups[(order, name, color)]; hd = QHBoxLayout(); t = QLabel(name); t.setStyleSheet(f"font-weight:700;color:{color};margin-top:8px;"); hd.addWidget(t); hd.addWidget(badge(str(len(items)), color)); hd.addStretch(); self.list_layout.addLayout(hd)
+            for c, col in items:
+                r = ListRow(s, c, col); r.clicked.connect(self.open_detail); r.toggle.connect(self.toggle_done); self.list_layout.addWidget(r)
+        if not rows: self.list_layout.addWidget(QLabel("No tasks match." if q or hide else "No tasks this month. Add one with + Add Task or Ctrl N.", objectName="muted"))
+        ndone = sum(1 for c, col in rows if c.get("done") or col["id"] == "done"); self.list_stat.setText(f"{len(rows)} tasks · {ndone} done")
 
     # ---------- rollover ----------
     def open_rollover(self):
         s = self.store; d = QDialog(self); d.setWindowTitle(f"Month Rollover · {s.year}"); d.setMinimumWidth(560); v = QVBoxLayout(d)
         v.addWidget(QLabel("Auto-rollover is ON: incomplete tasks from past months move forward each time the app opens. Completed tasks stay where they were finished. December → January of the next year.", wordWrap=True, objectName="muted2"))
         for mi in range(12):
-            inc, incc = s.incomplete_cards(mi, s.year), s.incomplete_cl(mi, s.year); tot = len(inc) + len(incc); past = s.month_past(mi, s.year)
+            inc = s.incomplete_cards(mi, s.year); tot = len(inc); past = s.month_past(mi, s.year)
             ty, tm = (s.year + 1, 0) if mi == 11 else (s.year, mi + 1)
             r = QHBoxLayout(); r.addWidget(QLabel(f"{MONTHS[mi]} {s.year} → {MONTHS[tm]} {ty}", objectName="sectitle"))
-            st = "🔒 Not ended yet" if not past else ("✅ All done" if tot == 0 else f"⏳ {tot} pending ({len(inc)} cards · {len(incc)} tasks)"); r.addWidget(QLabel(st, objectName="muted")); r.addStretch()
+            st = "🔒 Not ended yet" if not past else ("✅ All done" if tot == 0 else f"⏳ {tot} pending"); r.addWidget(QLabel(st, objectName="muted")); r.addStretch()
             if past and tot:
                 b = QPushButton(f"Move → {MONTHS[tm]} {ty}"); b.setObjectName("primary")
                 b.clicked.connect(lambda _, m=mi, dd=d: (s.migrate_month(m, s.year), self.toast("✅ Moved"), dd.accept(), self.refresh(), self.open_rollover())); r.addWidget(b)
@@ -1766,7 +1791,7 @@ class MainWindow(QMainWindow):
         hist = s.db["migrations"][-8:][::-1]
         if hist:
             v.addWidget(QLabel("HISTORY", objectName="navSection"))
-            for m in hist: v.addWidget(QLabel(f"{'🤖' if m.get('auto') else '👆'} {MONTHS[m['from']]} {m.get('fromYear')} → {MONTHS[m['to']]} {m.get('toYear')}   +{m['kanban']} cards, +{m['checklist']} tasks   {fmt_dt(m['at'])}", objectName="muted2"))
+            for m in hist: v.addWidget(QLabel(f"{'🤖' if m.get('auto') else '👆'} {MONTHS[m['from']]} {m.get('fromYear')} → {MONTHS[m['to']]} {m.get('toYear')}   +{m['kanban'] + m.get('checklist', 0)} tasks   {fmt_dt(m['at'])}", objectName="muted2"))
         cb = QPushButton("Close"); cb.clicked.connect(d.accept); v.addWidget(cb); d.exec()
 
     # ---------- backup ----------
@@ -1822,7 +1847,7 @@ class MainWindow(QMainWindow):
         p, _ = QFileDialog.getSaveFileName(self, "Export Excel", os.path.join(os.path.expanduser("~"), "Desktop", f"{APP_NAME}_{tag}_{self.store.year}.xlsx"), "Excel (*.xlsx)")
         if not p: return
         try:
-            export_excel(self.store, p, d.months(), d.inc_board.isChecked(), d.inc_cl.isChecked(), d.inc_sum.isChecked(), d.inc_done.isChecked())
+            export_excel(self.store, p, d.months(), d.inc_board.isChecked(), d.inc_sum.isChecked(), d.inc_done.isChecked())
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e)); return
         self.toast("📊 Exported: " + os.path.basename(p)); self.open_path(os.path.dirname(p))
