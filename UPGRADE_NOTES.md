@@ -12,6 +12,11 @@ Data file format is unchanged. Everything below is additive.
 - **Search & commands (Ctrl+K)** — tasks from every month and year, plus commands; no match → Enter creates the task.
 - **Needs attention** panel on the dashboard — overdue and due-within-7-days items from the board and the checklist, sorted by urgency, click to open.
 - **Keyboard** — `[` `]` change month, `Alt 1–4` pages, `?` shortcut sheet.
+- **Quick add** (Ctrl K → "Quick add") — a floating window with a live preview of the parsed priority, labels and due date; Enter saves, Shift+Enter → full form.
+- **Detail panel** — checklist items wrap and can be edited (✎ / double-click); labels wrap into rows; due date on its own row; no more horizontal scrolling.
+- **Dashboard** — KPI count-up, completion ring, open-tasks-by-priority bar, tasks-per-month bars highlight the shown month and are clickable.
+- **Motion** — page cross-fade, toast slide-in, ring/chart sweeps. Switch off under Appearance → "Animations & transitions".
+- 11 more colour presets (Ocean, Rose, Sunset, Graphite, Violet, Lavender, Mint, Sky, Slate, Peach).
 
 ## v2.0
 ### Renamed

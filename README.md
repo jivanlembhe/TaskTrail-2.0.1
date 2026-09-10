@@ -20,17 +20,17 @@ Optional installer (per-user, no admin rights): install [NSIS](https://nsis.sour
 `.github/workflows/build.yml` builds the portable exe and the installer on every push to `main` and on manual dispatch (download from the **Actions** tab → artifacts). Pushing a tag `v*` also attaches both files to a GitHub Release.
 
 ## Features
-- Dashboard: KPIs, overdue count, **Needs attention** (overdue + due within 7 days, board and checklist, click to open), recent activity, tasks-per-month chart
+- Dashboard: KPIs that count up, completion ring, **Needs attention** (overdue + due within 7 days, board and checklist, click to open), open-tasks-by-priority bar, recent activity, tasks-per-month chart (click a bar to open that month)
 - Task Board: drag to reorder within a column or move between columns; custom columns (⋯ to rename/recolour/move, "+ Column" to add); labels with a filter bar (search, priority, labels)
-- **Quick-add** box in every column: Enter saves, Shift+Enter opens the full form pre-filled. The title understands `!high` / `!low`, `#label` (created if it doesn't exist) and `@today`, `@tomorrow`, `@fri`, `@15` (day of the shown month), `@+3`, `@2026-10-01`
+- "+ Add Task", Ctrl N and the button under each column open the full task form. **Quick add** (Ctrl K → "Quick add") shows the parsed priority / labels / due date live as you type; Enter saves into the chosen column, Shift+Enter opens the full form pre-filled. The title understands `!high` / `!low`, `#label` (created if it doesn't exist) and `@today`, `@tomorrow`, `@fri`, `@15` (day of the shown month), `@+3`, `@2026-10-01`
 - **Calendar** page: month grid of this month's tasks by due date (checklist tasks too, dashed). Drag a task to another day to reschedule (logged in its activity); an *Unscheduled* tray lists open tasks with no date — drag them onto a day, or drop a dated task back into the tray to clear its date. Double-click a day (or its `+`) to add a task due that day. Overdue count shows on the Calendar nav item
 - **Search & commands (Ctrl+K)**: finds tasks in every month and year (title, description, sub-tasks), shows where they live and opens them; also runs commands (new task, go to page, jump to today, switch month, theme, export, rollover, labels, backup…). If nothing matches, Enter creates a task with that title (quick-add syntax works there too)
-- Card detail panel: column, priority, due date, labels, description, checklist, comments, activity log
+- Card detail panel: column, priority, due date, labels, description, checklist (✎ or double-click an item to edit it), comments, activity log
 - Task Checklist page with groups, sub-tasks, priority and due dates
 - Month grid + year switcher (◀ ▶); auto-rollover of unfinished tasks at month end, December → January of the next year; manual rollover panel with history
 - Backup & Restore: choose any folder (one-click OneDrive), backup now, restore from list or from any file; automatic backup every 30 min and on quit; 30 kept
 - Excel export (openpyxl): board sheets, checklist sheets, month-wise summary
-- Appearance: font family & size, text/accent/background/card colours, dark/light, six presets
+- Appearance: font family & size, text/accent/background/card colours, dark/light, 17 presets, animations on/off
 - System tray: closing the window hides to the tray; right-click the tray icon → Quit (closing twice within 3 s also quits)
 
 ## Keyboard

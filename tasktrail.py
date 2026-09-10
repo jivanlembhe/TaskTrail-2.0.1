@@ -19,7 +19,8 @@ import sys
 import time
 import uuid
 
-from PySide6.QtCore import Qt, QTimer, QSize, QRect, QPoint, Signal, QDate, QEvent, QMimeData
+from PySide6.QtCore import (Qt, QTimer, QSize, QRect, QRectF, QPoint, Signal, QDate, QEvent, QMimeData, QVariantAnimation,
+                            QPropertyAnimation, QEasingCurve, QAbstractAnimation)
 from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QPainter, QPixmap, QBrush, QPen,
                            QFontDatabase, QCursor, QShortcut, QKeySequence, QDrag)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QAbstractItemView, QScrollArea, QLineEdit, QComboBox, QTextEdit, QDialog,
                                QDialogButtonBox, QCheckBox, QDateEdit, QColorDialog, QFileDialog, QMessageBox,
                                QSystemTrayIcon, QMenu, QSizePolicy, QToolButton, QDockWidget, QSpinBox,
-                               QFontComboBox, QSlider, QInputDialog, QSplitter)
+                               QFontComboBox, QSlider, QInputDialog, QSplitter, QGraphicsOpacityEffect)
 
 APP_NAME = "TaskTrail"
 VERSION = "2.1.0"
@@ -60,6 +61,16 @@ PRESETS = [
     ("Forest", "dark", dict(bg="#0b1410", surface="#12211a", text="#e6f2ec", accent="#3ddbbf")),
     ("Ember", "dark", dict(bg="#16100d", surface="#241a16", text="#f7ece6", accent="#ff8c5a")),
     ("Paper", "light", dict(bg="#f5f2ea", surface="#fffdf8", text="#25231f", accent="#b5622e")),
+    ("Ocean", "dark", dict(bg="#061420", surface="#0d2233", text="#e3f1fb", accent="#35c2ff")),
+    ("Rose", "dark", dict(bg="#1a0f14", surface="#26161d", text="#fbe9ef", accent="#ff6584")),
+    ("Sunset", "dark", dict(bg="#1a1208", surface="#2a1f10", text="#fff1dd", accent="#ffb347")),
+    ("Graphite", "dark", dict(bg="#141414", surface="#1e1e1e", text="#ececec", accent="#9aa0bc")),
+    ("Violet", "dark", dict(bg="#120d1f", surface="#1b1430", text="#efe9ff", accent="#b48aff")),
+    ("Lavender", "light", dict(bg="#f3f0fa", surface="#ffffff", text="#2a2340", accent="#7c5cd6")),
+    ("Mint", "light", dict(bg="#eef7f3", surface="#ffffff", text="#16302a", accent="#1fa27a")),
+    ("Sky", "light", dict(bg="#eaf3fb", surface="#ffffff", text="#14243a", accent="#2b7de9")),
+    ("Slate", "light", dict(bg="#e9ecf1", surface="#f7f9fc", text="#1f2937", accent="#4f6b8f")),
+    ("Peach", "light", dict(bg="#fdf1ea", surface="#fffaf7", text="#3a2a22", accent="#f26b4e")),
 ]
 
 
@@ -174,8 +185,9 @@ def parse_date_token(tok, year, month):
     return None
 
 
-def parse_quick(store, text):
-    """'Renew SSL !high #ops @fri' → dict(title, priority, dueDate, labels). #label creates the label if needed."""
+def parse_quick(store, text, create=True):
+    """'Renew SSL !high #ops @fri' → dict(title, priority, dueDate, labels). #label creates the label if needed
+    (create=False: don't create, list the would-be-new names under 'new' instead — used by the live preview)."""
     out = dict(title="", priority="med", dueDate="", labels=[]); keep = []
     for w in text.split():
         sig, val = w[0], w[1:]
@@ -191,6 +203,9 @@ def parse_quick(store, text):
             else: keep.append(w)
         else:
             l = next((x for x in store.labels if x["name"].lower() == v), None)
+            if not l and not create:
+                if val not in out.setdefault("new", []): out["new"].append(val)
+                continue
             if not l:
                 l = {"id": uid(), "name": val, "color": LABEL_PALETTE[len(store.labels) % len(LABEL_PALETTE)]}; store.labels.append(l)
             if l["id"] not in out["labels"]: out["labels"].append(l["id"])
@@ -511,23 +526,51 @@ def hline():
 
 
 class BarChart(QWidget):
-    """Tasks per month (current year)."""
+    """Tasks per month (current year). Click a bar to open that month; the shown month is highlighted."""
+    clicked = Signal(int)
+
     def __init__(self, get_values, accent):
-        super().__init__(); self.get_values = get_values; self.accent = accent
-        self.setMinimumHeight(110)
+        super().__init__(); self.get_values = get_values; self.accent = accent; self.current = -1; self.progress = 1.0
+        self.setMinimumHeight(110); self.setCursor(QCursor(Qt.PointingHandCursor))
 
     def paintEvent(self, e):
-        vals = self.get_values()
-        mx = max(1, max(vals))
+        vals = self.get_values(); mx = max(1, max(vals))
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
-        w = self.width(); h = self.height() - 20
-        bw = (w - 11 * 6) / 12
+        w = self.width(); h = self.height() - 20; bw = (w - 11 * 6) / 12
         for i, v in enumerate(vals):
-            bh = max(4, int(v / mx * (h - 8)))
-            x = int(i * (bw + 6))
-            p.setPen(Qt.NoPen); p.setBrush(QColor(self.accent))
-            p.drawRoundedRect(x, h - bh, int(bw), bh, 3, 3)
-            p.setPen(QColor("#5c6382")); p.drawText(QRect(x, h + 2, int(bw), 16), Qt.AlignCenter, MONTHS[i][0])
+            bh = max(4, int(v / mx * (h - 8) * self.progress)); x = int(i * (bw + 6)); c = QColor(self.accent)
+            if i != self.current: c.setAlphaF(0.42)
+            p.setPen(Qt.NoPen); p.setBrush(c); p.drawRoundedRect(x, h - bh, int(bw), bh, 3, 3)
+            p.setPen(QColor(self.accent if i == self.current else "#5c6382")); p.drawText(QRect(x, h + 2, int(bw), 16), Qt.AlignCenter, MONTHS[i][0])
+        p.end()
+
+    def mousePressEvent(self, e):
+        i = int(e.position().x() / (self.width() / 12))
+        if 0 <= i < 12: self.clicked.emit(i)
+
+
+class Ring(QWidget):
+    """Completion ring (0–100). `value` is animated by the dashboard."""
+    def __init__(self, color):
+        super().__init__(); self.color = color; self.value = 0; self.setFixedSize(56, 56)
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); r = QRectF(5, 5, 46, 46)
+        pen = QPen(QColor(self.color)); pen.setWidth(6); pen.setCapStyle(Qt.RoundCap); track = QColor(self.color); track.setAlphaF(0.18)
+        p.setPen(QPen(track, 6)); p.drawEllipse(r); p.setPen(pen); p.drawArc(r, 90 * 16, -int(360 * 16 * self.value / 100))
+        p.setPen(QColor(self.color)); f = p.font(); f.setBold(True); f.setPixelSize(12); p.setFont(f); p.drawText(r, Qt.AlignCenter, f"{int(self.value)}%"); p.end()
+
+
+class PriMix(QWidget):
+    """Open tasks by priority as one stacked bar."""
+    def __init__(self):
+        super().__init__(); self.counts = (0, 0, 0); self.setFixedHeight(10)
+
+    def paintEvent(self, e):
+        tot = sum(self.counts); p = QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setPen(Qt.NoPen); x = 0.0
+        if not tot: p.setBrush(QColor("#5c6382")); p.setOpacity(0.25); p.drawRoundedRect(QRectF(0, 0, self.width(), 10), 5, 5); p.end(); return
+        for n, c in zip(self.counts, (PRI_COLOR["high"], PRI_COLOR["med"], PRI_COLOR["low"])):
+            if n: w = self.width() * n / tot; p.setBrush(QColor(c)); p.drawRoundedRect(QRectF(x, 0, w, 10), 5, 5); x += w
         p.end()
 
 
@@ -684,7 +727,7 @@ class CalDay(QFrame):
 class TaskDialog(QDialog):
     def __init__(self, parent, store, card=None, col_id="todo", preset=None):
         super().__init__(parent); self.store = store; self.card = card
-        self.setWindowTitle("Edit Task" if card else "New Task"); self.setMinimumWidth(480)
+        self.setWindowTitle("Edit Task" if card else "New Task"); self.setMinimumWidth(540)
         v = QVBoxLayout(self); v.setSpacing(10)
         self.title = QLineEdit(card["title"] if card else ""); self.title.setPlaceholderText("What needs to be done?")
         self.desc = QTextEdit(card.get("desc", "") if card else ""); self.desc.setPlaceholderText("Details or notes…"); self.desc.setFixedHeight(70)
@@ -696,7 +739,7 @@ class TaskDialog(QDialog):
         for k, lab in PRI_LABEL.items():
             self.pri.addItem(lab, k)
         self.pri.setCurrentIndex(self.pri.findData(card.get("priority", "med") if card else "med"))
-        self.has_date = QCheckBox("Due date"); self.date = QDateEdit(QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat("yyyy-MM-dd")
+        self.has_date = QCheckBox("Due date"); self.date = QDateEdit(QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat("yyyy-MM-dd"); self.date.setMinimumWidth(150)
         if card and card.get("dueDate"):
             self.has_date.setChecked(True); self.date.setDate(QDate.fromString(card["dueDate"], "yyyy-MM-dd"))
         self.date.setEnabled(self.has_date.isChecked()); self.has_date.toggled.connect(self.date.setEnabled)
@@ -710,9 +753,11 @@ class TaskDialog(QDialog):
         self.label_box = QWidget(); self.label_layout = QHBoxLayout(self.label_box); self.label_layout.setContentsMargins(0, 0, 0, 0)
         self.sel_labels = set(card.get("labels", [])) if card else set(); self.rebuild_labels(); v.addWidget(self.label_box)
         # subtasks
-        v.addWidget(QLabel("Sub-tasks"))
+        v.addWidget(QLabel("Sub-tasks   (double-click an item to edit it)"))
         self.subs = [dict(s) for s in (card.get("subs", []) if card else [])]
-        self.sub_list = QListWidget(); self.sub_list.setFixedHeight(110); self.rebuild_subs(); v.addWidget(self.sub_list)
+        self.sub_list = QListWidget(); self.sub_list.setFixedHeight(130); self.sub_list.setWordWrap(True); self.sub_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sub_list.setStyleSheet("QListWidget::item{padding:3px 6px;margin:0 0 2px 0;border-radius:6px;}QListWidget::item:selected{background:rgba(128,128,128,0.25);color:palette(text);}")
+        self.sub_list.itemDoubleClicked.connect(lambda it: self.edit_sub(self.sub_list.row(it))); self.rebuild_subs(); v.addWidget(self.sub_list)
         sr = QHBoxLayout(); self.sub_inp = QLineEdit(); self.sub_inp.setPlaceholderText("Add sub-task… (Enter)")
         self.sub_inp.returnPressed.connect(self.add_sub); ab = QPushButton("+"); ab.clicked.connect(self.add_sub); rb = QPushButton("Remove selected"); rb.clicked.connect(self.remove_sub)
         sr.addWidget(self.sub_inp); sr.addWidget(ab); sr.addWidget(rb); v.addLayout(sr)
@@ -755,6 +800,11 @@ class TaskDialog(QDialog):
         r = self.sub_list.currentRow()
         if r >= 0:
             del self.subs[r]; self.rebuild_subs()
+
+    def edit_sub(self, r):
+        if not 0 <= r < len(self.subs): return
+        t, ok = QInputDialog.getMultiLineText(self, "Edit sub-task", "Text:", self.subs[r]["text"])
+        if ok and t.strip(): self.subs[r]["text"] = t.strip(); self.rebuild_subs(); self.sub_list.setCurrentRow(r)
 
     def accept(self):
         if not self.title.text().strip():
@@ -908,6 +958,36 @@ class ChecklistTaskDialog(QDialog):
                     dueDate=self.date.date().toString("yyyy-MM-dd") if self.has_date.isChecked() else "", subs=self.subs, updatedAt=now_iso())
 
 
+class QuickAdd(QDialog):
+    """Floating quick-add window: type once, see the parsed priority / labels / due date live.
+    Enter saves into the chosen column; Shift+Enter (or 'Full form') opens TaskDialog pre-filled."""
+    def __init__(self, win, col_id="todo"):
+        super().__init__(win); self.win = win; self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint); self.setFixedWidth(640)
+        v = QVBoxLayout(self); v.setContentsMargins(12, 12, 12, 10); v.setSpacing(8); top = QHBoxLayout(); top.setSpacing(8)
+        self.inp = QLineEdit(); self.inp.setPlaceholderText("What needs to be done?   !high  #label  @fri"); self.inp.textChanged.connect(self.preview); self.inp.returnPressed.connect(self.save)
+        self.col = QComboBox()
+        for c in win.store.columns: self.col.addItem(f"{c.get('icon', '')} {c['label']}", c["id"])
+        self.col.setCurrentIndex(max(0, self.col.findData(col_id))); top.addWidget(self.inp, 1); top.addWidget(self.col); v.addLayout(top)
+        self.chips = QHBoxLayout(); self.chips.setSpacing(6); v.addLayout(self.chips)
+        foot = QHBoxLayout(); foot.addWidget(QLabel("Enter save · Shift+Enter full form · Esc close     !high !low · #label · @today @tomorrow @fri @15 @+3 @2026-10-01", objectName="muted")); foot.addStretch()
+        fb = QPushButton("Full form ▸"); fb.setObjectName("ghost"); fb.clicked.connect(self.full); foot.addWidget(fb); v.addLayout(foot)
+        QShortcut(QKeySequence("Shift+Return"), self, activated=self.full); self.preview(); QTimer.singleShot(0, self.inp.setFocus)
+
+    def preview(self, _=None):
+        MainWindow._clear(self.chips); s = self.win.store; p = parse_quick(s, self.inp.text(), create=False)
+        self.chips.addWidget(badge(PRI_LABEL[p["priority"]], PRI_COLOR[p["priority"]]))
+        if p["dueDate"]: self.chips.addWidget(badge("📅 " + fmt_date(p["dueDate"]), "#8890b0"))
+        for l in (x for x in s.labels if x["id"] in p["labels"]): self.chips.addWidget(badge(l["name"], "#ffffff", l["color"]))
+        for n in p.get("new", []): self.chips.addWidget(badge("+ " + n, "#8890b0"))
+        t = QLabel(p["title"] or "Title…", objectName="muted2"); t.setStyleSheet("font-weight:600;"); self.chips.addWidget(t); self.chips.addStretch()
+
+    def save(self):
+        if self.win.qa_submit(self.col.currentData(), self.inp.text()): self.accept()
+
+    def full(self):
+        col, text = self.col.currentData(), self.inp.text(); self.accept(); self.win.add_task(col, parse_quick(self.win.store, text))
+
+
 class Palette(QDialog):
     """Ctrl+K: search tasks across every month and year, or run a command."""
     def __init__(self, win):
@@ -921,7 +1001,7 @@ class Palette(QDialog):
 
     def commands(self):
         w = self.win; light = w.appearance.get("theme") == "light"
-        cmds = [("＋", "New task", "Ctrl N", lambda: w.add_task()), ("◈", "Go to Dashboard", "Alt 1", lambda: w.show_page("dashboard")), ("⊞", "Go to Task Board", "Alt 2", lambda: w.show_page("kanban")),
+        cmds = [("＋", "New task", "Ctrl N", lambda: w.add_task()), ("⚡", "Quick add", "!high #label @fri", lambda: QuickAdd(w).exec()), ("◈", "Go to Dashboard", "Alt 1", lambda: w.show_page("dashboard")), ("⊞", "Go to Task Board", "Alt 2", lambda: w.show_page("kanban")),
                 ("☑", "Go to Task Checklist", "Alt 3", lambda: w.show_page("checklist")), ("▦", "Go to Calendar", "Alt 4", lambda: w.show_page("calendar")),
                 ("📍", "Jump to today", f"{MONTHS_LONG[dt.date.today().month - 1]} {dt.date.today().year}", w.go_today),
                 ("🌙" if light else "☀️", "Switch to dark theme" if light else "Switch to light theme", "", w.toggle_theme),
@@ -1054,7 +1134,7 @@ class MainWindow(QMainWindow):
     def __init__(self, store):
         super().__init__(); self.store = store; self.setWindowTitle(APP_NAME); self.resize(1400, 880); self.setMinimumSize(980, 620)
         self.detail_ref = None; self.filter_q = ""; self.filter_pri = ""; self.filter_labels = set(); self.cl_filter = "all"; self.cl_q = ""
-        self.settings = read_settings(); self.appearance = {**dict(theme="dark", font="", size=13, text="", accent="", bg="", surface=""), **self.settings.get("appearance", {}), **self.store.db["meta"].get("appearance_py", {})}
+        self.settings = read_settings(); self.appearance = {**dict(theme="dark", font="", size=13, text="", accent="", bg="", surface="", motion=True), **self.settings.get("appearance", {}), **self.store.db["meta"].get("appearance_py", {})}
         self._build(); self.apply_appearance(); self._tray(); self.show_page("dashboard")
         moved = self.store.auto_migrate()
         if moved:
@@ -1093,7 +1173,7 @@ class MainWindow(QMainWindow):
         self.page_title = QLabel("Dashboard"); self.page_title.setObjectName("pageTitle"); self.page_month = QLabel(); self.page_month.setObjectName("pageMonth"); self.page_month.setMargin(6)
         th.addWidget(self.page_title); th.addWidget(self.page_month); th.addStretch()
         self.theme_btn = QPushButton("🌙"); self.theme_btn.setToolTip("Toggle dark/light"); self.theme_btn.clicked.connect(self.toggle_theme)
-        ex = QPushButton("⬇ Export Excel"); ex.clicked.connect(self.export_excel); ad = QPushButton("+ Add Task"); ad.setObjectName("primary"); ad.clicked.connect(lambda: self.add_task())
+        ex = QPushButton("⬇ Export Excel"); ex.clicked.connect(self.export_excel); ad = QPushButton("+ Add Task"); ad.setObjectName("primary"); ad.setToolTip("New task (Ctrl N)"); ad.clicked.connect(lambda: self.add_task())
         th.addWidget(self.theme_btn); th.addWidget(ex); th.addWidget(ad); main.addWidget(tb)
         self.stack = QStackedWidget(); main.addWidget(self.stack, 1)
         self.pages = {}
@@ -1114,10 +1194,11 @@ class MainWindow(QMainWindow):
         self.kpi_row = QHBoxLayout(); v.addLayout(self.kpi_row)
         row = QHBoxLayout(); v.addLayout(row, 1)
         p0 = QFrame(); p0.setObjectName("panel"); l0 = QVBoxLayout(p0); hr = QHBoxLayout(); hr.addWidget(QLabel("Needs attention", objectName="sectitle")); self.attn_sub = QLabel(objectName="muted"); hr.addStretch(); hr.addWidget(self.attn_sub); l0.addLayout(hr)
-        self.attn_box = QVBoxLayout(); l0.addLayout(self.attn_box); l0.addStretch(); row.addWidget(p0, 3)
+        self.attn_box = QVBoxLayout(); l0.addLayout(self.attn_box); l0.addStretch()
+        l0.addWidget(QLabel("Open tasks by priority", objectName="muted")); self.pri_mix = PriMix(); l0.addWidget(self.pri_mix); self.pri_legend = QLabel(objectName="muted"); l0.addWidget(self.pri_legend); row.addWidget(p0, 3)
         p1 = QFrame(); p1.setObjectName("panel"); l1 = QVBoxLayout(p1); l1.addWidget(QLabel("Recent Activity", objectName="sectitle")); self.activity_box = QVBoxLayout(); l1.addLayout(self.activity_box); l1.addStretch(); row.addWidget(p1, 3)
         p2 = QFrame(); p2.setObjectName("panel"); l2 = QVBoxLayout(p2); l2.addWidget(QLabel("Tasks / Month", objectName="sectitle"))
-        self.chart = BarChart(lambda: [sum(len(self.store.kanban(i).get(c["id"], [])) for c in self.store.columns) for i in range(12)], "#6c8aff"); l2.addWidget(self.chart); l2.addStretch(); row.addWidget(p2, 2)
+        self.chart = BarChart(lambda: [sum(len(self.store.kanban(i).get(c["id"], [])) for c in self.store.columns) for i in range(12)], "#6c8aff"); self.chart.clicked.connect(self.switch_month); l2.addWidget(self.chart); l2.addWidget(QLabel("Click a bar to open that month", objectName="muted")); l2.addStretch(); row.addWidget(p2, 2)
         return self._scroll(w)
 
     def _build_board(self):
@@ -1186,7 +1267,31 @@ class MainWindow(QMainWindow):
     # ---------- helpers ----------
     def toast(self, msg, ms=2600):
         self.toast_lbl.setText(msg); self.toast_lbl.adjustSize(); self._place_toast(); self.toast_lbl.show(); self.toast_lbl.raise_()
+        if self.motion():       # slide up from just below its resting spot
+            end = self.toast_lbl.pos(); self.animate(self.toast_lbl, b"pos", end + QPoint(0, 18), end, 220)
         QTimer.singleShot(ms, self.toast_lbl.hide)
+
+    def motion(self):
+        return bool(self.appearance.get("motion", True))
+
+    def animate(self, target, prop, start, end, ms=260, easing=QEasingCurve.OutCubic, on_value=None, on_done=None):
+        """One helper for every transition: QVariantAnimation calling on_value(v), or QPropertyAnimation on `prop`.
+        The animation is a child of `target`, so a re-render that deletes the widget also stops the animation."""
+        for old in target.findChildren(QAbstractAnimation): old.stop()      # one animation per target at a time
+        if not self.motion():       # jump straight to the final state
+            on_value(end) if on_value else target.setProperty(prop, end)
+            if on_done: on_done()
+            return None
+        a = QVariantAnimation(target) if on_value else QPropertyAnimation(target, prop, target)
+        a.setStartValue(start); a.setEndValue(end); a.setDuration(ms); a.setEasingCurve(easing)
+        if on_value: a.valueChanged.connect(on_value)
+        if on_done: a.finished.connect(on_done)
+        a.start(QAbstractAnimation.DeleteWhenStopped); return a
+
+    def fade_in(self, w, ms=180):
+        if not self.motion(): return
+        eff = QGraphicsOpacityEffect(w); w.setGraphicsEffect(eff)
+        self.animate(eff, b"opacity", 0.0, 1.0, ms, QEasingCurve.OutQuad, on_done=lambda: w.setGraphicsEffect(None))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -1197,9 +1302,10 @@ class MainWindow(QMainWindow):
         self.toast_lbl.move(c.right() - self.toast_lbl.width() - 24, c.bottom() - self.toast_lbl.height() - 24)
 
     def show_page(self, key):
-        self.page = key
+        changed = getattr(self, "page", None) != key; self.page = key
         for k, b in self.nav_btns.items(): b.setChecked(k == key)
         self.stack.setCurrentWidget(self.pages[key]); self.page_title.setText({"dashboard": "Dashboard", "kanban": "Task Board", "checklist": "Task Checklist", "calendar": "Calendar"}[key]); self.refresh()
+        if changed: self.fade_in(self.pages[key])
 
     def refresh(self):
         s = self.store; self.page_month.setText(f"{MONTHS_LONG[s.month]} {s.year}"); self.year_lbl.setText(str(s.year))
@@ -1256,8 +1362,11 @@ class MainWindow(QMainWindow):
         overdue = self.overdue_n
         for lab, val, sub, color in (("TOTAL TASKS", total, f"{overdue} overdue" if overdue else "This month", "#6c8aff"), ("TODAY'S FOCUS", today, "Tasks for today", "#ffb347"),
                                      ("IN PROGRESS", wip, "Currently working", "#b48aff"), ("COMPLETED", done, f"{pct}% of month", "#3ddbbf")):
-            f = QFrame(); f.setObjectName("kpi"); fv = QVBoxLayout(f); fv.addWidget(QLabel(lab, objectName="kpiLabel")); fv.addWidget(QLabel(str(val), objectName="kpiVal"))
-            sl = QLabel(sub); sl.setObjectName("muted"); sl.setStyleSheet(f"color:{'#ff6584' if 'overdue' in sub else '#5c6382'}"); fv.addWidget(sl); f.setStyleSheet(f"QFrame#kpi{{border-bottom:3px solid {color};}}"); self.kpi_row.addWidget(f)
+            f = QFrame(); f.setObjectName("kpi"); fh = QHBoxLayout(f); fv = QVBoxLayout(); fv.addWidget(QLabel(lab, objectName="kpiLabel")); vl = QLabel("0", objectName="kpiVal"); fv.addWidget(vl)
+            sl = QLabel(sub); sl.setObjectName("muted"); sl.setStyleSheet(f"color:{'#ff6584' if 'overdue' in sub else '#5c6382'}"); fv.addWidget(sl); fh.addLayout(fv, 1); f.setStyleSheet(f"QFrame#kpi{{border-bottom:3px solid {color};}}"); self.kpi_row.addWidget(f)
+            self.animate(vl, None, 0, val, 520, on_value=lambda n, l=vl: l.setText(str(int(n))))
+            if lab == "COMPLETED":
+                ring = Ring(color); fh.addWidget(ring, 0, Qt.AlignVCenter); self.animate(ring, None, 0.0, float(pct), 700, on_value=lambda x, r=ring: (setattr(r, "value", x), r.update()))
         self._clear(self.attn_box); items = []; today = dt.date.today()
         def days_to(iso):
             try: return (dt.date.fromisoformat(iso) - today).days
@@ -1277,6 +1386,9 @@ class MainWindow(QMainWindow):
             when = f"{-df}d overdue" if df < 0 else "Today" if df == 0 else "Tomorrow" if df == 1 else (today + dt.timedelta(df)).strftime("%a") if df <= 6 else fmt_date((today + dt.timedelta(df)).isoformat())
             b = QPushButton(f"{title}     {when}"); b.setObjectName("addk"); b.setStyleSheet(f"QPushButton#addk{{border-left:3px solid {color};" + ("color:#ff6584;" if df < 0 else "") + "}"); b.clicked.connect(lambda _, f=fn: f()); self.attn_box.addWidget(b)
         if len(items) > 8: self.attn_box.addWidget(QLabel(f"+{len(items) - 8} more in the calendar", objectName="muted"))
+        open_ = [x for c in s.columns if c["id"] != "done" for x in kd.get(c["id"], [])]; n = {k: sum(1 for x in open_ if x.get("priority", "med") == k) for k in ("high", "med", "low")}
+        self.pri_mix.counts = (n["high"], n["med"], n["low"]); self.pri_mix.update()
+        self.pri_legend.setText(f"<b style='color:{PRI_COLOR['high']}'>{n['high']}</b> high &nbsp; <b style='color:{PRI_COLOR['med']}'>{n['med']}</b> medium &nbsp; <b style='color:{PRI_COLOR['low']}'>{n['low']}</b> low" if open_ else "No open tasks")
         self._clear(self.activity_box)
         cards = [(x, c) for c in s.columns for x in kd.get(c["id"], [])]
         cards.sort(key=lambda t: t[0].get("updatedAt") or t[0].get("createdAt") or "", reverse=True)
@@ -1284,7 +1396,7 @@ class MainWindow(QMainWindow):
         for x, c in cards[:6]:
             b = QPushButton(("✓ " if x.get("done") else "○ ") + x["title"] + f"   ·  {c['label']} · {PRI_LABEL[x.get('priority', 'med')]}"); b.setObjectName("addk")
             b.clicked.connect(lambda _, cid=x["id"], col=c["id"]: (self.show_page("kanban"), self.open_detail(cid, col))); self.activity_box.addWidget(b)
-        self.chart.update()
+        self.chart.current = s.month; self.animate(self.chart, None, 0.0, 1.0, 600, on_value=lambda x: (setattr(self.chart, "progress", x), self.chart.update()))
 
     # ---------- board ----------
     def on_search(self, t):
@@ -1305,7 +1417,7 @@ class MainWindow(QMainWindow):
             b.setStyleSheet(f"QPushButton{{border-color:{l['color']};color:{l['color']};padding:3px 10px;}}QPushButton:checked{{background:{l['color']};color:#fff;}}")
             b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             b.toggled.connect(lambda on, lid=l["id"]: (self.filter_labels.add(lid) if on else self.filter_labels.discard(lid), self.render_board())); self.label_bar.addWidget(b)
-        self._clear(self.board_layout); kd = s.kanban(); self.qa_inputs = {}
+        self._clear(self.board_layout); kd = s.kanban()
         for col in s.columns:
             cw = QWidget(); cw.setFixedWidth(280); cv = QVBoxLayout(cw); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(8)
             head = QFrame(); head.setObjectName("colhead"); hh = QHBoxLayout(head); hh.setContentsMargins(12, 8, 8, 8)
@@ -1322,10 +1434,7 @@ class MainWindow(QMainWindow):
                 it = QListWidgetItem(); it.setData(Qt.UserRole, c["id"]); w = CardWidget(s, c, col); it.setSizeHint(w.sizeHint() + QSize(0, 6)); lst.addItem(it); lst.setItemWidget(it, w)
                 w.clicked.connect(self.open_detail); w.edit.connect(self.edit_task); w.delete.connect(self.delete_task); w.toggle.connect(self.toggle_done)
             lst.fit_items(); cv.addWidget(lst, 1)
-            qa = QLineEdit(); qa.setPlaceholderText("+ Add task…   !high #label @fri"); qa.setToolTip("Enter: add  ·  Shift+Enter: open the full form with this pre-filled\n!high / !low  ·  #label  ·  @today @tomorrow @fri @15 @+3 @2026-10-01")
-            qa.returnPressed.connect(lambda cid=col["id"], e=qa: self.qa_submit(cid, e.text()))
-            QShortcut(QKeySequence("Shift+Return"), qa, context=Qt.WidgetShortcut, activated=lambda cid=col["id"], e=qa: self.add_task(cid, parse_quick(s, e.text())))
-            cv.addWidget(qa); self.qa_inputs[col["id"]] = qa; self.board_layout.addWidget(cw)
+            ab = QPushButton("+ Add Task"); ab.setObjectName("addk"); ab.setToolTip("New task in this column  ·  Ctrl K → Quick add for the !high #label @fri syntax"); ab.clicked.connect(lambda _, cid=col["id"]: self.add_task(cid)); cv.addWidget(ab); self.board_layout.addWidget(cw)
         addc = QPushButton("+ Add column"); addc.setObjectName("addk"); addc.setFixedWidth(200); addc.clicked.connect(lambda: self.column_dialog(None)); self.board_layout.addWidget(addc, 0, Qt.AlignTop)
 
     def on_drop(self, cid, from_col, to_col, before):
@@ -1347,11 +1456,10 @@ class MainWindow(QMainWindow):
         v = d.values(); self._create_card(v.pop("col"), **v); self.toast("Task added!")
 
     def qa_submit(self, col_id, text):
-        """Quick-add: 'Renew SSL !high #ops @fri' → card in col_id; keeps the focus in that column's box."""
+        """Quick-add: 'Renew SSL !high #ops @fri' → new card in col_id (returns it, or None if there's no title)."""
         p = parse_quick(self.store, text)
-        if not p["title"]: return
-        self._create_card(col_id, **p); self.toast(f"Added “{p['title']}”" + (f" · due {fmt_date(p['dueDate'])}" if p["dueDate"] else ""))
-        if self.page == "kanban" and col_id in self.qa_inputs: self.qa_inputs[col_id].setFocus()
+        if not p["title"]: return None
+        card = self._create_card(col_id, **p); self.toast(f"Added “{p['title']}”" + (f" · due {fmt_date(p['dueDate'])}" if p["dueDate"] else "")); return card
 
     def edit_task(self, cid, col_id):
         card, col_id = self.store.find_card(cid, col_id)
@@ -1436,18 +1544,24 @@ class MainWindow(QMainWindow):
         if card.get("dueDate"): dcb.setChecked(True); de.setDate(QDate.fromString(card["dueDate"], "yyyy-MM-dd"))
         de.setEnabled(dcb.isChecked()); dcb.toggled.connect(lambda on: self.dset("dueDate", de.date().toString("yyyy-MM-dd") if on else "")); de.dateChanged.connect(lambda d: self.dset("dueDate", d.toString("yyyy-MM-dd")) if dcb.isChecked() else None)
         for i, (lab, w) in enumerate((("Column", colc), ("Priority", pri))): g.addWidget(QLabel(lab, objectName="muted"), 0, i); g.addWidget(w, 1, i)
-        dl = QHBoxLayout(); dl.addWidget(dcb); dl.addWidget(de); g.addWidget(QLabel("Due date", objectName="muted"), 0, 2); g.addLayout(dl, 1, 2); v.addLayout(g)
-        v.addWidget(QLabel("LABELS", objectName="navSection")); lr = QHBoxLayout()
-        for l in s.labels:
+        dl = QHBoxLayout(); dl.addWidget(dcb); dl.addWidget(de); dl.addStretch(); g.addWidget(QLabel("Due date", objectName="muted"), 2, 0); g.addLayout(dl, 3, 0, 1, 2); v.addLayout(g)
+        lh = QHBoxLayout(); lh.addWidget(QLabel("LABELS", objectName="navSection")); lh.addStretch(); mg = QPushButton("Manage"); mg.setObjectName("ghost"); mg.clicked.connect(self.manage_labels); lh.addWidget(mg); v.addLayout(lh)
+        lr = QGridLayout(); lr.setSpacing(6)        # ponytail: 3 chips per row instead of a flow layout; wraps within the 440 px dock
+        for i, l in enumerate(s.labels):
             b = QPushButton(l["name"]); b.setCheckable(True); b.setChecked(l["id"] in card.get("labels", [])); b.setStyleSheet(f"QPushButton{{border-color:{l['color']};color:{l['color']};padding:3px 10px;}}QPushButton:checked{{background:{l['color']};color:#fff;}}")
-            b.toggled.connect(lambda on, lid=l["id"]: self.dlabel(lid, on)); lr.addWidget(b)
-        if not s.labels: lr.addWidget(QLabel("No labels yet", objectName="muted"))
-        lr.addStretch(); mg = QPushButton("Manage"); mg.clicked.connect(self.manage_labels); lr.addWidget(mg); v.addLayout(lr)
+            b.toggled.connect(lambda on, lid=l["id"]: self.dlabel(lid, on)); lr.addWidget(b, i // 3, i % 3)
+        if not s.labels: lr.addWidget(QLabel("No labels yet", objectName="muted"), 0, 0)
+        v.addLayout(lr)
         v.addWidget(QLabel("DESCRIPTION", objectName="navSection")); desc = QTextEdit(card.get("desc", "")); desc.setPlaceholderText("Add details, links, notes…"); desc.setFixedHeight(80)
         desc.focusOutEvent = lambda e, te=desc: (QTextEdit.focusOutEvent(te, e), self.dset("desc", te.toPlainText())); v.addWidget(desc)
         subs = card.get("subs", []); sd = sum(1 for x in subs if x.get("done")); v.addWidget(QLabel(f"CHECKLIST  {sd}/{len(subs)}" if subs else "CHECKLIST", objectName="navSection"))
         for x in subs:
-            r = QHBoxLayout(); cb = QCheckBox(x["text"]); cb.setChecked(bool(x.get("done"))); cb.toggled.connect(lambda on, sid=x["id"]: self.dsub(sid, on)); rm = QPushButton("✕"); rm.setObjectName("ghost"); rm.clicked.connect(lambda _, sid=x["id"]: self.dsub_remove(sid)); r.addWidget(cb, 1); r.addWidget(rm); v.addLayout(r)
+            r = QHBoxLayout(); r.setSpacing(6); cb = QCheckBox(); cb.setChecked(bool(x.get("done"))); cb.toggled.connect(lambda on, sid=x["id"]: self.dsub(sid, on))
+            tl = QLabel(x["text"]); tl.setWordWrap(True); tl.setToolTip("Double-click to edit"); tl.setStyleSheet("text-decoration:line-through;color:#5c6382;" if x.get("done") else "")
+            tl.mouseDoubleClickEvent = lambda e, sid=x["id"]: self.dsub_edit(sid)
+            eb = QPushButton("✎"); eb.setObjectName("ghost"); eb.setToolTip("Edit item"); eb.clicked.connect(lambda _, sid=x["id"]: self.dsub_edit(sid))
+            rm = QPushButton("✕"); rm.setObjectName("ghost"); rm.clicked.connect(lambda _, sid=x["id"]: self.dsub_remove(sid))
+            r.addWidget(cb, 0, Qt.AlignTop); r.addWidget(tl, 1); r.addWidget(eb, 0, Qt.AlignTop); r.addWidget(rm, 0, Qt.AlignTop); v.addLayout(r)
         ar = QHBoxLayout(); si = QLineEdit(); si.setPlaceholderText("Add an item… (Enter)"); si.returnPressed.connect(lambda: self.dsub_add(si.text())); ab = QPushButton("Add"); ab.clicked.connect(lambda: self.dsub_add(si.text())); ar.addWidget(si); ar.addWidget(ab); v.addLayout(ar)
         comments = card.get("comments", []); v.addWidget(QLabel(f"COMMENTS  {len(comments) or ''}", objectName="navSection"))
         cr = QHBoxLayout(); ci = QTextEdit(); ci.setPlaceholderText("Write a comment… (Ctrl+Enter to post)"); ci.setFixedHeight(56); pb = QPushButton("Post"); pb.setObjectName("primary"); pb.clicked.connect(lambda: self.dcomment(ci.toPlainText()))
@@ -1457,7 +1571,7 @@ class MainWindow(QMainWindow):
             t = QLabel(m["text"]); t.setWordWrap(True); fl.addWidget(t); v.addWidget(f)
         v.addWidget(QLabel("ACTIVITY", objectName="navSection"))
         for a in reversed(card.get("activity", [])[-20:]): v.addWidget(QLabel(f"{fmt_dt(a['at'])}   {a['text']}", objectName="muted2", wordWrap=True))
-        v.addStretch(); sa = QScrollArea(); sa.setWidgetResizable(True); sa.setWidget(inner); L.addWidget(sa, 1)
+        v.addStretch(); sa = QScrollArea(); sa.setWidgetResizable(True); sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); sa.setWidget(inner); L.addWidget(sa, 1)
         foot = QHBoxLayout(); foot.setContentsMargins(16, 8, 16, 12); mk = QPushButton("↩ Reopen" if done else "✓ Mark complete"); mk.setObjectName("" if done else "primary"); mk.clicked.connect(lambda: self.toggle_done(card["id"], col_id))
         ed = QPushButton("✎ Edit in form"); ed.clicked.connect(lambda: self.edit_task(card["id"], col_id)); dl2 = QPushButton("Delete"); dl2.setObjectName("danger"); dl2.clicked.connect(lambda: self.delete_task(card["id"], col_id))
         foot.addWidget(mk); foot.addWidget(ed); foot.addStretch(); foot.addWidget(dl2); L.addLayout(foot)
@@ -1498,6 +1612,14 @@ class MainWindow(QMainWindow):
         card, col = self._dcard(); t = t.strip()
         if not card or not t: return
         card.setdefault("subs", []).append({"id": uid(), "text": t, "done": False}); self.store.log(card, f"Checklist item added: {t}"); self.store.save(); self.refresh()
+
+    def dsub_edit(self, sid):
+        card, col = self._dcard()
+        if not card: return
+        x = next((x for x in card.get("subs", []) if x["id"] == sid), None)
+        if not x: return
+        t, ok = QInputDialog.getMultiLineText(self, "Edit checklist item", "Text:", x["text"])
+        if ok and t.strip() and t.strip() != x["text"]: x["text"] = t.strip(); card["updatedAt"] = now_iso(); self.store.log(card, "Checklist item edited"); self.store.save(); self.refresh()
 
     def dsub_remove(self, sid):
         card, col = self._dcard()
@@ -1744,12 +1866,13 @@ class MainWindow(QMainWindow):
             v.addLayout(r)
         crow("Text colour", "text", "text"); crow("Accent colour (buttons, highlights)", "accent", "accent"); crow("Background", "bg", "bg"); crow("Cards & panels", "surface", "s2")
         tr = QHBoxLayout(); tr.addWidget(QLabel("Dark / light base theme"), 1); tb = QPushButton(("☀️ Light" if a.get("theme") == "light" else "🌙 Dark") + " — switch"); tb.clicked.connect(lambda: (self.toggle_theme(), d.accept(), self.open_appearance())); tr.addWidget(tb); v.addLayout(tr)
+        mr = QHBoxLayout(); mr.addWidget(QLabel("Animations & transitions"), 1); mc = QCheckBox("On"); mc.setChecked(self.motion()); mc.toggled.connect(lambda on: (a.__setitem__("motion", on), self.save_appearance())); mr.addWidget(mc); v.addLayout(mr)
         v.addWidget(QLabel("PRESETS", objectName="navSection")); pg = QGridLayout()
         for i, (name, theme, vals) in enumerate(PRESETS):
             b = QPushButton(name); b.setStyleSheet(f"background:{vals.get('bg', THEMES[theme]['bg'])};color:{vals.get('text', THEMES[theme]['text'])};border-color:{vals.get('accent', '#6c8aff')};")
-            b.clicked.connect(lambda _, t=theme, vv=vals: (a.update(theme=t, bg=vv.get("bg", ""), surface=vv.get("surface", ""), text=vv.get("text", ""), accent=vv.get("accent", "")), self.save_appearance(), d.accept(), self.open_appearance())); pg.addWidget(b, i // 3, i % 3)
+            b.clicked.connect(lambda _, t=theme, vv=vals: (a.update(theme=t, bg=vv.get("bg", ""), surface=vv.get("surface", ""), text=vv.get("text", ""), accent=vv.get("accent", "")), self.save_appearance(), d.accept(), self.open_appearance())); pg.addWidget(b, i // 4, i % 4)
         v.addLayout(pg)
-        rr = QHBoxLayout(); ra = QPushButton("Reset everything to default"); ra.clicked.connect(lambda: (a.update(theme="dark", font="", size=13, text="", accent="", bg="", surface=""), self.save_appearance(), d.accept(), self.open_appearance())); rr.addWidget(ra); rr.addStretch(); cl = QPushButton("Close"); cl.clicked.connect(d.accept); rr.addWidget(cl); v.addLayout(rr)
+        rr = QHBoxLayout(); ra = QPushButton("Reset everything to default"); ra.clicked.connect(lambda: (a.update(theme="dark", font="", size=13, text="", accent="", bg="", surface="", motion=True), self.save_appearance(), d.accept(), self.open_appearance())); rr.addWidget(ra); rr.addStretch(); cl = QPushButton("Close"); cl.clicked.connect(d.accept); rr.addWidget(cl); v.addLayout(rr)
         d.exec()
 
 
