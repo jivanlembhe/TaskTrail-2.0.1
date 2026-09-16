@@ -2,7 +2,7 @@
 Unicode true
 !include "MUI2.nsh"
 !define APP "TaskTrail"
-!define VER "2.2.0"
+!define VER "2.2.1"
 !define EXE "TaskTrail.exe"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\TaskTrailPy"
 
@@ -36,8 +36,14 @@ Function .onInit
 FunctionEnd
 
 Section "Install"
+  ; Upgrade in place: remove files from any previous version (old single-exe or new folder build).
+  ; User data lives in %APPDATA%\TaskTrail and is never touched.
+  Delete "$INSTDIR\${EXE}"
+  Delete "$INSTDIR\icon.ico"
+  Delete "$INSTDIR\Uninstall.exe"
+  RMDir /r "$INSTDIR\_internal"
   SetOutPath "$INSTDIR"
-  File /r "dist\${APP}\*.*"
+  File /r "dist\${APP}\*"
   File "icon.ico"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateDirectory "$SMPROGRAMS\${APP}"
