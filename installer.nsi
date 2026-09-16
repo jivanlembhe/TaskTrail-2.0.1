@@ -37,7 +37,7 @@ FunctionEnd
 
 Section "Install"
   SetOutPath "$INSTDIR"
-  File "dist\${EXE}"
+  File /r "dist\${APP}\*.*"
   File "icon.ico"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateDirectory "$SMPROGRAMS\${APP}"
@@ -57,10 +57,7 @@ SectionEnd
 
 Section "Uninstall"
   nsExec::ExecToLog 'taskkill /f /im "${EXE}"'
-  Delete "$INSTDIR\${EXE}"
-  Delete "$INSTDIR\icon.ico"
-  Delete "$INSTDIR\Uninstall.exe"
-  RMDir "$INSTDIR"
+  RMDir /r "$INSTDIR"
   Delete "$SMPROGRAMS\${APP}\${APP}.lnk"
   Delete "$SMPROGRAMS\${APP}\Uninstall ${APP}.lnk"
   RMDir "$SMPROGRAMS\${APP}"

@@ -21,6 +21,7 @@ import uuid
 
 from PySide6.QtCore import (Qt, QTimer, QSize, QRect, QRectF, QPoint, Signal, QDate, QEvent, QMimeData, QVariantAnimation,
                             QPropertyAnimation, QEasingCurve, QAbstractAnimation)
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QPainter, QPixmap, QBrush, QPen,
                            QFontDatabase, QCursor, QShortcut, QKeySequence, QDrag)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -1277,10 +1278,15 @@ class MainWindow(QMainWindow):
         pm = QPixmap(64, 64); pm.fill(Qt.transparent); p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing); p.setBrush(QColor("#6c8aff")); p.setPen(Qt.NoPen); p.drawRoundedRect(4, 4, 56, 56, 14, 14)
         p.setPen(QColor("#ffffff")); f = QFont(); f.setBold(True); f.setPixelSize(34); p.setFont(f); p.drawText(pm.rect(), Qt.AlignCenter, "T"); p.end()
         self.setWindowIcon(QIcon(pm)); self.tray = QSystemTrayIcon(QIcon(pm), self); m = QMenu()
-        m.addAction(f"Open {APP_NAME}", self.show_window); m.addSeparator(); m.addAction("Backup Data Now", self.backup_now_ui)
-        m.addAction("Open Backup Folder", lambda: self.open_path(get_backup_dir())); m.addAction("Open Data Folder", lambda: self.open_path(USER_DATA)); m.addSeparator(); m.addAction("Quit", self.quit_app)
-        self.tray.setContextMenu(m); self.tray.activated.connect(lambda r: self.show_window() if r == QSystemTrayIcon.DoubleClick else None); self.tray.setToolTip(APP_NAME); self.tray.show()
+        m.addAction(f"Open {APP_NAME}", self.show_window); m.addAction("Minimize to tray", self.hide); m.addSeparator(); m.addAction("Backup Data Now", self.backup_now_ui)
+        m.addAction("Open Backup Folder", lambda: self.open_path(get_backup_dir())); m.addAction("Open Data Folder", lambda: self.open_path(USER_DATA)); m.addSeparator()
+        self.close_to_tray_act = QAction("Keep running in tray when window is closed", m, checkable=True); self.close_to_tray_act.setChecked(bool(self.settings.get("close_to_tray", False)))
+        self.close_to_tray_act.toggled.connect(self.set_close_to_tray); m.addAction(self.close_to_tray_act); m.addAction("Quit", self.quit_app)
+        self.tray.setContextMenu(m); self.tray.activated.connect(lambda r: self.show_window() if r in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger) else None); self.tray.setToolTip(APP_NAME); self.tray.show()
         self.quitting = False; self._last_close = 0; self._hint_shown = False
+
+    def set_close_to_tray(self, on):
+        self.settings["close_to_tray"] = bool(on); st = read_settings(); st["close_to_tray"] = bool(on); write_settings(st)
 
     def show_window(self):
         self.show(); self.raise_(); self.activateWindow()
@@ -1290,7 +1296,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         if self.quitting: e.accept(); return
-        if time.time() - self._last_close < 3: self.quitting = True; e.accept(); QApplication.quit(); return
+        if not self.settings.get("close_to_tray", False) or time.time() - self._last_close < 3:
+            self.quitting = True; self.store.save(); self.store.backup_now(); e.accept(); QApplication.quit(); return
         self._last_close = time.time(); e.ignore(); self.hide()
         if not self._hint_shown:
             self._hint_shown = True; self.tray.showMessage(APP_NAME, "Still running in the system tray. Right-click the tray icon and choose Quit to exit.")
@@ -1901,10 +1908,23 @@ class MainWindow(QMainWindow):
         d.exec()
 
 
+SINGLE_INSTANCE_KEY = f"{APP_NAME}-single-instance-{os.getlogin() if hasattr(os, 'getlogin') else ''}"
+
+
 def main():
     app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
+    # If TaskTrail is already running (e.g. hidden in the tray), tell it to show itself and exit this copy.
+    probe = QLocalSocket(); probe.connectToServer(SINGLE_INSTANCE_KEY)
+    if probe.waitForConnected(300):
+        probe.write(b"show"); probe.waitForBytesWritten(300); probe.disconnectFromServer(); sys.exit(0)
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)  # clear a stale socket left by a crash
+    server = QLocalServer(); server.listen(SINGLE_INSTANCE_KEY)
     store = Store(); w = MainWindow(store); w.show()
-    sys.exit(app.exec())
+    def _on_conn():
+        c = server.nextPendingConnection()
+        if c: c.readyRead.connect(lambda: (c.readAll(), w.show_window())); c.disconnected.connect(c.deleteLater)
+    server.newConnection.connect(_on_conn)
+    rc = app.exec(); server.close(); sys.exit(rc)
 
 
 if __name__ == "__main__":

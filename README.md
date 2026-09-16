@@ -32,7 +32,7 @@ Optional installer (per-user, no admin rights): install [NSIS](https://nsis.sour
 - Backup & Restore: choose any folder (one-click OneDrive), backup now, restore from list or from any file; automatic backup every 30 min and on quit; 30 kept
 - Excel export (openpyxl): board sheets, checklist sheets, month-wise summary
 - Appearance: font family & size, text/accent/background/card colours, dark/light, 17 presets, animations on/off
-- System tray: closing the window hides to the tray; right-click the tray icon → Quit (closing twice within 3 s also quits)
+- System tray: closing the window quits TaskTrail. To keep it running in the background instead, right-click the tray icon and tick *Keep running in tray when window is closed* (then closing twice within 3 s still quits). *Minimize to tray* is always available from the tray menu. Launching TaskTrail while it is already running just brings the existing window to the front
 
 ## Keyboard
 `Ctrl K` search & commands · `Ctrl N` new task · `[` `]` previous / next month · `Alt 1–4` Dashboard · Board · List · Calendar · `?` all shortcuts · `Ctrl Shift B` backup now
