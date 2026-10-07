@@ -1,6 +1,6 @@
 # TaskTrail
 
-Task planner, to-do list and status tracker for Windows (also runs on macOS/Linux) — dashboard with a *Needs attention* panel, drag-and-drop task board with custom columns and labels, a list view of the same tasks, recurring tasks, calendar with drag-to-reschedule, Ctrl+K search across every month, automatic monthly rollover, Backup & Restore, Excel export and a system-tray mode. Single-file Python app built on PySide6.
+Task planner, to-do list and status tracker for Windows (also runs on macOS/Linux) — dashboard with a *Needs attention* panel, drag-and-drop task board with custom columns and labels, a list view of the same tasks, recurring tasks, calendar with drag-to-reschedule, Ctrl+K search across every month, automatic monthly rollover, Backup & Restore, Excel export and a system-tray mode. Python app built on PySide6 (`tasktrail.py` + the `glass.py` design layer).
 
 Data lives in `%APPDATA%\TaskTrail\flowboard_data.json` (backups in `%APPDATA%\TaskTrail\backups`, or any folder you choose, e.g. OneDrive). Old FlowBoard / TaskTrail v1 files are upgraded automatically on first load. Files from v2.1 and earlier have their Checklist groups merged into the board on first launch (each group becomes a label; a backup of the old file is written first).
 
@@ -37,10 +37,45 @@ Optional installer (per-user, no admin rights): install [NSIS](https://nsis.sour
 ## Keyboard
 `Ctrl K` search & commands · `Ctrl N` new task · `[` `]` previous / next month · `Alt 1–4` Dashboard · Board · List · Calendar · `?` all shortcuts · `Ctrl Shift B` backup now
 
+## Performance report (Word, list view, AI-assisted)  — sidebar → *Performance Report* or Ctrl K → "performance report"
+Follows the structure of a hand-written monthly report: a **cover page** (title, month, then *Prepared By · Employee Code · Appraiser · Program · Joining Date*), a **"Performance Report"** page heading, **"Internal"** (configurable) bottom-left and page numbers bottom-right starting after the cover.
+- **Category headings = your task labels** (e.g. *Admission Data:*), each followed by a bullet list of past-tense action statements ("Prepared and shared PPF performance analysis data…") with key phrases in bold.
+- **Sub-tasks are nested bullets** (• → o → ▪, real Word list levels) under the task they belong to.
+- **Work in Progress and Carried Forward** lists unfinished tasks with **Completed:** (already-finished sub-tasks) and **Pending:** items — rolled-over tasks are found automatically.
+- Overview, Challenges and Plan for Next Month sections (from the month's numbers).
+
+Flow: pick month → fill cover details (remembered) → *Generate preview* → **edit any line** (overview, challenges, plan, and one statement per task) → *Export to Word…*.
+
+**AI:** every number is computed locally; Claude (Anthropic API) only phrases the statements — verb-first, no "I" — using nothing but the supplied facts. Add a short note in a task's description (purpose/outcome) and the AI uses it. Enter an API key in the dialog or set `ANTHROPIC_API_KEY`. Only that month's task titles, notes, sub-tasks, dates and counts are sent; cover details stay on your PC. No key / offline → an offline template writes the text (titles that already start with a verb, like "Prepared…", are kept as written). Key is stored in `settings.json` in plain text.
+
+## Working with lots of tasks
+- Board columns render a page at a time (*Show 30 more*, Done shows 10) — 2,000 tasks open in well under a second instead of ~13 s.
+- **Quick filters** (Overdue · Due ≤ 7 days · High priority), **Sort** (manual · due date · priority · newest) and a **Compact** card density; header counts show *matching/total*.
+- The Task List pages each group (25 rows, *Show more*).
+
+## Auto-priority by due date
+Overdue, due today or tomorrow → **High**; due within 7 days → at least **Medium**. It only ever *raises* priority, runs on start-up, after every change and at midnight, and logs each change in the task's activity. Setting a priority yourself locks that task (right-click → Priority → *Auto* unlocks). Switch off in *Appearance → Tasks*.
+
+## Calendar
+Driven by **due date across all months** (a task filed in another month still shows on its day and can be dragged), **Month / Week** views, *+N more* overflow with a day panel, red ● for high priority, *Hide completed*, an **Overdue before this view** backlog you can drag onto a day, weekends dimmed.
+
+## Glass UI (v2.3)
+- **Window:** Windows 11 Mica / Acrylic / Mica Alt (Windows 10 1803+: Acrylic) behind a translucent tint; macOS/Linux get a simulated glass backdrop. *Appearance → Window effect* switches material, tint, or turns it off; env `TASKTRAIL_GLASS=off` disables native blur entirely.
+- **Depth:** frosted cards/panels with layered soft shadows, lit accent edges, hover lift + glow. 10px controls, 12px panels, 8px menus.
+- **Sidebar:** collapsible (Ctrl B, auto-folds below 1100px), spring animation, painted line icons.
+- **Overlays:** Ctrl K palette and Quick add blur the app beneath; right-click a task for a glass menu (Open, Edit, Complete, Move to, Priority, Delete).
+- **Theme:** System / Light / Dark. *System* follows the OS live (cross-fades). Secondary text colours are auto-adjusted to stay ≥ 4.5:1 on the card surface, for every preset.
+- **Async:** Excel export and backup run on worker threads with a neon progress toast and a thin activity line.
+
 ## Files
-- `tasktrail.py` — the whole app
-- `test_tasktrail.py` — quick-add parser check (`python test_tasktrail.py`)
-- `requirements.txt` — PySide6, openpyxl
+- `report.py` — monthly report engine (facts, AI/template writer, Word list-view builder)
+- `cover_art.py` — embedded cover-page artwork
+- `glass.py` — design tokens, backdrops, glass widgets, blur overlays, async jobs
+- `tasktrail.py` — the app
+- `test_tasktrail.py` — quick-add parser + recurrence checks
+- `test_report.py` — report, AI client (mock server), auto-priority, calendar and scale checks
+- `test_glass.py` — headless UI/contrast/async checks (`QT_QPA_PLATFORM=offscreen python test_glass.py`)
+- `requirements.txt` — PySide6, openpyxl, python-docx
 - `build_win.bat`, `installer.nsi`, `icon.ico`, `icon.png` — Windows packaging
 
 See `UPGRADE_NOTES.md` for what changed in each release.

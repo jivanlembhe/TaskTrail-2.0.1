@@ -1,5 +1,24 @@
 # TaskTrail (formerly FlowBoard Pro) — upgrade notes
 
+## v2.4.1 — Report in list view (matches the user's own August report)
+Replaced the table layout with a list-view report: cover page with employee details, label-based category headings, bullet lists, nested sub-task bullets, Completed/Pending under unfinished tasks, header/footer like the original. Statements are action-style (no "I"); every statement is editable before export. Fixed: review step was not shown after generation (caught in testing).
+
+## v2.4 — Reports, scale, auto-priority, calendar
+Data format unchanged (new optional card field `prioLock`). New module `report.py`; new dependency `python-docx`.
+- **Monthly performance report → Word**, AI-written sentences with offline fallback and a review step (see README).
+- **Scale:** per-column paging, quick filters, sorting, compact density; list paging. 2,000-task board 13.3 s → 0.7 s.
+- **Auto-priority** by due date (escalate-only, manual override locks).
+- **Calendar rebuilt:** due-date driven across months, Month/Week, overflow day panel, overdue backlog, fixed cross-month drag/open (previously a task filed under another month could not be seen or dragged).
+- Known limit: the AI path is verified against a mock server, not the live API.
+
+## v2.3 — Glass UI
+Data file, format and backups are unchanged. New `glass.py` module (PyInstaller picks it up automatically).
+- Mica/Acrylic window backdrop on Windows, simulated glass elsewhere; frosted layered-shadow cards; collapsible sidebar; blurred Ctrl K / Quick add; glass right-click menus; System/Light/Dark with live OS following; glow progress with async export + backup; new *Next 7 days* dashboard chart; vector line icons; accessible checkboxes (tick mark, not colour only).
+- New default theme mode is **System** for fresh installs; an explicitly saved Dark/Light choice is kept.
+- Fixed: `os.getlogin()` crash at import when there is no controlling terminal; re-render no longer flashes stale widgets for a frame; toast timer no longer hides a newer toast early.
+- Shortcuts added: `Ctrl B` toggle sidebar.
+- **Not verified on real Windows hardware** (developed headless): DWM Mica/Acrylic calls. If the window looks wrong, set *Appearance → Material → Off*.
+
 ## Python-only repository
 The Electron/HTML edition has been removed; the PySide6 app that used to live in `python/` is now the repository root.
 The data file, its format and the backup layout are unchanged, so existing installs keep all their data.

@@ -8,6 +8,7 @@ python -m PyInstaller --noconfirm --onedir --windowed --name TaskTrail --icon ic
   --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtMultimedia ^
   --exclude-module PySide6.QtCharts --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtDataVisualization ^
   --exclude-module PySide6.QtPdf --exclude-module PySide6.QtLocation ^
+  --collect-data docx --hidden-import report --hidden-import cover_art ^
   tasktrail.py
 echo.
 echo Done: dist\TaskTrail\TaskTrail.exe
