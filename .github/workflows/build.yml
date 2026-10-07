@@ -1,7 +1,7 @@
 name: Build TaskTrail for Windows
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, feature/ui-motion-effects]
     tags: ['v*']
   workflow_dispatch:
 jobs:
