@@ -1,7 +1,7 @@
 name: Build TaskTrail for Windows
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, feature/ui-motion-effects]
     tags: ['v*']
   workflow_dispatch:
 jobs:
@@ -17,6 +17,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
+      - name: Run tests (headless)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          python test_tasktrail.py
+          python test_glass.py
+          python test_report.py
       - name: Build TaskTrail.exe
         run: >
           python -m PyInstaller --noconfirm --onedir --windowed --name TaskTrail --icon icon.ico
@@ -24,7 +31,12 @@ jobs:
           --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtMultimedia
           --exclude-module PySide6.QtCharts --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtDataVisualization
           --exclude-module PySide6.QtPdf --exclude-module PySide6.QtLocation
+          --collect-data docx --hidden-import report --hidden-import cover_art
           tasktrail.py
+      - name: Verify one-folder build
+        run: |
+          if (!(Test-Path "dist\TaskTrail\TaskTrail.exe")) { Write-Error "dist\TaskTrail\TaskTrail.exe not found - PyInstaller must run with --onedir"; exit 1 }
+          Get-ChildItem dist\TaskTrail | Select-Object Name, Length
       - name: Install NSIS
         run: choco install nsis -y --no-progress
       - name: Build installer
