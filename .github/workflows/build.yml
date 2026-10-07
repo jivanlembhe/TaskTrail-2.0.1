@@ -52,12 +52,16 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
+                - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
           name: TaskTrail-Setup
-          path: TaskTrail-Setup-*.exe
+          path: TaskTrail-Setup.exe
           if-no-files-found: error
+
       - name: Attach to GitHub Release (on v* tags)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            TaskTrail-Setup-*.exe
+            TaskTrail-Setup.exe
